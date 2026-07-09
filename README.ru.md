@@ -15,6 +15,14 @@
 
 0). Зависимости;
 Установите python3-пакет *python3-cryptography* с помощаью пакетного менеджера ОС или утилиты pip3.
+```
+dnf install python3-cryptography
+or
+apt install python3-cryptography
+or 
+pip3 install python3-cryptography
+```
+
 
 1). Запустите команду для генерации ключа:
 Пример с использование только CPU:

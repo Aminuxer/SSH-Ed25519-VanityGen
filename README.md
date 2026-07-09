@@ -15,6 +15,13 @@ Python-3 multithreaded version. Load only CPU cores.
 
 0). Dependencies;
 Install python3 package *python3-cryptography* with OS package manager or over pip3 tool.
+```
+dnf install python3-cryptography
+or
+apt install python3-cryptography
+or 
+pip3 install python3-cryptography
+```
 
 1). Run command for generate key:
 On CPU only:

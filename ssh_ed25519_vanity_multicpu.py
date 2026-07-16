@@ -4,18 +4,25 @@
      Ed-25519 SSH Vanity Key Generator [Multi CPU thread, FAST]
      100% AI-Generated: QWEN-Coder-Next 80B/3B
      Inspired by Aminuxer
-     Version 2026-07-09-cN
+     Version 2026-07-17-cN
 
 Usage:
-    python3 ssh_ed25519_vanity_multicpu.py <pattern> [-i] [-w <workers>] [-o output_file]
+    python3 ssh_ed25519_vanity_multicpu.py <pattern> [-i] [-w <workers>] [-o output_file] [--debug]
 
 Examples:
     python3 ssh_ed25519_vanity_multicpu.py User -i -w 8
-    python3 ssh_ed25519_vanity_multicpu.py mykey -o mykey
+    python3 ssh_ed25519_vanity_multicpu.py mykey -o mykey --debug
 
 The generated OpenSSH private key can be used with:
     ssh -i mykey vanity@host
+
+Options:
+    -i          Case-insensitive pattern matching
+    -w <N>      Number of worker processes (default: CPU count)
+    -o <file>   Save keys to files (output_file.pub and output_file)
+    --debug     Show seed hex in output (for testing/diagnosis)
 """
+
 
 
 import os
@@ -27,6 +34,12 @@ from typing import Optional, Tuple
 import time
 import base64
 
+# Use monotonic for reliable time measurement
+try:
+    _time_func = time.monotonic
+except AttributeError:
+    _time_func = time.time
+
 # Valid Base64 characters for OpenSSH public key (no padding '=' used)
 B64_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
 
@@ -37,10 +50,11 @@ def validate_pattern(pattern: str) -> bool:
             return False
     return True
 
-def worker_loop(pattern: str, case_insensitive: bool, result_queue, stop_event, seed_queue, progress_queue):
+def worker_loop(pattern: str, case_insensitive: bool, result_queue, stop_event, seed_queue, progress_queue, debug_mode: bool):
     """Worker process that generates keys and checks for pattern"""
     pattern_lower = pattern.lower() if case_insensitive else pattern
     iterations = 0
+    last_progress_time = _time_func()
     batch_size = 10000
 
     while not stop_event.is_set():
@@ -63,19 +77,32 @@ def worker_loop(pattern: str, case_insensitive: bool, result_queue, stop_event, 
             public_str = public_bytes.decode()
             pubkey_b64 = public_str.split()[1]
 
+            # Ed25519 public key format: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI<32bytes>
+            # The prefix "AAAAC3NzaC1lZDI1NTE5AAAAI" is always the same (25 chars)
+            # We only search in the variable part after the fixed prefix
+            variable_part_start = 25  # Position after "AAAAC3NzaC1lZDI1NTE5AAAAI"
+            
             iterations += 1
 
-            # Check if pattern matches
-            search_str = pubkey_b64.lower() if case_insensitive else pubkey_b64
+            # Check if pattern matches in the variable part only
+            if len(pubkey_b64) > variable_part_start:
+                search_str = pubkey_b64[variable_part_start:].lower() if case_insensitive else pubkey_b64[variable_part_start:]
+            else:
+                search_str = pubkey_b64.lower() if case_insensitive else pubkey_b64
             if pattern_lower in search_str:
-                # Send both public key and seed
-                seed_hex = seed.hex()
-                result_queue.put(('found', (public_str, seed_hex)))
+                # Send both public key and seed (seed always for key reconstruction)
+                # First send remaining iterations, then found result
+                if iterations > 0:
+                    progress_queue.put(iterations)
+                result_queue.put(('found', (public_str, seed.hex())))
                 return
 
-            # Check stop event between batches
-            if iterations % 100000 == 0:
+            # Check progress by time - send every 5 seconds of wall-clock time
+            current_time = _time_func()
+            if current_time - last_progress_time >= 5.0:
                 progress_queue.put(iterations)
+                iterations = 0
+                last_progress_time = current_time
 
         except Exception as e:
             result_queue.put(('error', str(e)))
@@ -85,7 +112,8 @@ def worker_loop(pattern: str, case_insensitive: bool, result_queue, stop_event, 
 
 def generate_vanity_key(pattern: str, case_insensitive: bool = False,
                         num_workers: Optional[int] = None,
-                        output_file: Optional[str] = None) -> Optional[Tuple[str, str]]:
+                        output_file: Optional[str] = None,
+                        debug_mode: bool = False) -> Optional[Tuple[str, str, int]]:
     """
     Generate ED25519 vanity key with multi-threading
 
@@ -94,9 +122,10 @@ def generate_vanity_key(pattern: str, case_insensitive: bool = False,
         case_insensitive: If True, ignore case when matching pattern
         num_workers: Number of worker processes (default: CPU count)
         output_file: If provided, save keys to files
+        debug_mode: If True, show seed hex in output
 
     Returns:
-        Tuple of (public_key_string, private_key_pem) or None if failed
+        Tuple of (public_key_string, private_key_pem, total_iterations) or None if failed
     """
     pattern_len = len(pattern)
     if pattern_len > 44:
@@ -116,6 +145,7 @@ def generate_vanity_key(pattern: str, case_insensitive: bool = False,
 
     print(f"[*] Searching for pattern: {pattern}")
     print(f"[*] Case insensitive: {case_insensitive}")
+    print(f"[*] Debug mode: {debug_mode}")
 
     # Default to CPU count workers
     if num_workers is None:
@@ -138,15 +168,19 @@ def generate_vanity_key(pattern: str, case_insensitive: bool = False,
     # Start worker processes
     workers = []
     for _ in range(num_workers):
-        p = mp.Process(target=worker_loop, args=(pattern, case_insensitive, result_queue, stop_event, seed_queue, progress_queue))
+        p = mp.Process(target=worker_loop, args=(pattern, case_insensitive, result_queue, stop_event, seed_queue, progress_queue, debug_mode))
         p.start()
         workers.append(p)
 
     # Monitor progress and collect results
     total_iterations = 0
     found_result = None
-    last_progress_time = time.time()
+    start_time = _time_func()
+    last_progress_time = _time_func()
     last_progress_iter = 0
+    last_rate = 0
+    first_progress_printed = False
+    current_progress_line = ""
 
     try:
         while True:
@@ -155,6 +189,13 @@ def generate_vanity_key(pattern: str, case_insensitive: bool = False,
 
                 if msg_type == 'found':
                     found_result = data
+                    # Drain progress queue to get all accumulated iterations
+                    try:
+                        while True:
+                            delta = progress_queue.get_nowait()
+                            total_iterations += delta
+                    except:
+                        pass
                     break
                 elif msg_type == 'error':
                     print(f"[-] Worker error: {data}")
@@ -171,17 +212,25 @@ def generate_vanity_key(pattern: str, case_insensitive: bool = False,
                 except:
                     pass
 
-                # Print progress every 10 seconds
-                current_time = time.time()
-                if current_time - last_progress_time >= 10:
-                    elapsed = current_time - last_progress_time
+                # Debug: show what we have
+                # print(f"DEBUG: elapsed={elapsed:.1f}, total={total_iterations}, last_iter={last_progress_iter}", file=sys.stderr)
+                # sys.stderr.flush()
+
+                # Print progress every 5 seconds (without newline in same line)
+                current_time = _time_func()
+                elapsed_total = current_time - start_time
+                elapsed_interval = current_time - last_progress_time
+                if elapsed_interval >= 5:
                     if total_iterations > last_progress_iter:
-                        rate = (total_iterations - last_progress_iter) / elapsed
-                        print(f"[+] Progress: {total_iterations:,} keys checked (avg ~{rate:,.0f} keys/sec)")
+                        rate = (total_iterations - last_progress_iter) / elapsed_interval
+                        last_rate = rate
+                        current_progress_line = f"\r[+] Progress: {total_iterations:,} keys ({format_duration(elapsed_total)}) (avg ~{rate:,.0f} keys/sec)"
                     else:
-                        print(f"[+] Progress: {total_iterations:,} keys checked (no new keys)")
+                        current_progress_line = f"\r[+] Progress: {total_iterations:,} keys ({format_duration(elapsed_total)}) (no new keys)"
+                    print(current_progress_line, end="", flush=True)
                     last_progress_time = current_time
                     last_progress_iter = total_iterations
+                    first_progress_printed = True
 
             except Exception as e:
                 print(f"[+] Monitoring error: {e}")
@@ -198,15 +247,27 @@ def generate_vanity_key(pattern: str, case_insensitive: bool = False,
             p.terminate()
             p.join(timeout=2)
 
+    # Clear progress line if printed
+    if first_progress_printed and current_progress_line:
+        print()  # Newline after progress bar
+
     # Print final stats
     if found_result:
         public_str, seed_hex = found_result
+        # Clear any remaining progress line
+        if first_progress_printed and current_progress_line:
+            print()  # Newline after progress bar
         print(f"\n[+] Found match!")
         print(f"[+] Pattern: {pattern}")
         print(f"[+] Public key: {public_str}")
-        print(f"[+] Seed (hex): {seed_hex}")
-
-        # Generate private key from seed
+        # Only show seed in debug mode
+        if debug_mode:
+            print(f"[+] Seed (hex): {seed_hex}")
+        # Calculate and show average rate using last_rate if available
+        elapsed_total = _time_func() - start_time
+        rate = last_rate if last_rate > 0 else (total_iterations / elapsed_total if elapsed_total > 0 else 0)
+        print(f"[+] Checked keys: {total_iterations:,} (avg ~{rate:,.0f} keys/sec)")
+        # Generate private key from seed (always available in result)
         seed = bytes.fromhex(seed_hex)
         private_key = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
         private_pem = private_key.private_bytes(
@@ -244,11 +305,19 @@ def generate_vanity_key(pattern: str, case_insensitive: bool = False,
                 raise IOError(f"Failed to write private key file: {output_file} - {e}")
             print(f"[+] Written: {output_file} (mode 600)")
 
-        return public_str, private_pem.decode()
+        return public_str, private_pem.decode(), total_iterations, last_rate
     else:
-        elapsed = time.time() - last_progress_time if 'last_progress_time' in locals() else 0
+        # Ensure we print a final newline after progress if it was overwritten
+        if first_progress_printed and current_progress_line:
+            print()  # Newline after progress bar
+        elapsed = _time_func() - last_progress_time if 'last_progress_time' in locals() else 0
+        # For very fast searches (< 5 seconds), total_iterations might be 0 if workers
+        # didn't have time to send progress data. At minimum, we checked at least 1 key.
+        if total_iterations == 0:
+            total_iterations = 1
+        # Use last_rate from progress if available, otherwise calculate from total
         if total_iterations > 0 and elapsed > 0:
-            rate = total_iterations / elapsed
+            rate = last_rate if last_rate > 0 else total_iterations / elapsed
             print(f"[+] Search completed. Total iterations: {total_iterations:,} (avg ~{rate:,.0f} keys/sec)")
         else:
             print(f"[+] Search completed. Total iterations: {total_iterations:,}")
@@ -274,12 +343,26 @@ def format_duration(seconds: float) -> str:
     return " ".join(parts)
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: ssh_ed25519_vanity_multicpu.py <pattern> [-i] [-w <workers>] [-o output_file]")
-        sys.exit(1)
+    if len(sys.argv) < 2 or '--help' in sys.argv or '-h' in sys.argv:
+        print("Usage: ssh_ed25519_vanity_multicpu.py <pattern> [-i] [-w <workers>] [-o output_file] [--debug]")
+        print()
+        print("Examples:")
+        print("    python3 ssh_ed25519_vanity_multicpu.py User -i -w 8")
+        print("    python3 ssh_ed25519_vanity_multicpu.py mykey -o mykey --debug")
+        print()
+        print("The generated OpenSSH private key can be used with:")
+        print("    ssh -i mykey vanity@host")
+        print()
+        print("Options:")
+        print("    -i          Case-insensitive pattern matching")
+        print("    -w <N>      Number of worker processes (default: CPU count)")
+        print("    -o <file>   Save keys to files (output_file.pub and output_file)")
+        print("    --debug     Show seed hex in output (for testing/diagnosis)")
+        sys.exit(0)
 
     pattern = sys.argv[1]
     case_insensitive = '-i' in sys.argv
+    debug_mode = '--debug' in sys.argv
     num_workers = None
     output_file = None
 
@@ -294,16 +377,25 @@ if __name__ == "__main__":
         elif sys.argv[i] == '-o' and i + 1 < len(sys.argv):
             output_file = sys.argv[i + 1]
             i += 2
+        elif sys.argv[i] == '--debug':
+            debug_mode = True
+            i += 1
         elif sys.argv[i].startswith('-'):
             i += 1
         else:
             i += 1
 
     # Start timing
-    start_time = time.time()
-    result = generate_vanity_key(pattern, case_insensitive, num_workers, output_file)
+    start_time = _time_func()
+    result = generate_vanity_key(pattern, case_insensitive, num_workers, output_file, debug_mode)
 
     if result:
-        duration = time.time() - start_time
+        duration = _time_func() - start_time
+        public_str, private_pem, total_iterations, last_rate = result
+        # For very fast searches (< 5 seconds), total_iterations might be 0 if workers
+        # didn't have time to send progress data. At minimum, we found 1 key.
+        if total_iterations == 0:
+            total_iterations = 1
         print(f"[+] Total time: {format_duration(duration)}")
+        print(f"[+] Checked keys: {total_iterations:,}")
 

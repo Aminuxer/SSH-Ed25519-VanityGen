@@ -82,7 +82,12 @@ Example Output:
   - Yes. You can try different variants.
 
 * How fast keys checked ?
-  - ~ 200K keys per second on Dual Core Celeron G9300. Up to 7-8M keys per second on Core-i7 2700K / Xeon.
+    ```
+    ~ 30 000 keys/sec Celeron G9300 2.80 GHz (on 2-x cores).
+    ~ 45 000 keys/sec Core-i7 2700K (on 8-x cores).
+    ~ 130 000 keys/sec Xeon(R) CPU E5-2670 0 @ 2.60GHz (on 20-х cores)
+    ~ 550 000 keys/sec  AMD EPYC 9334 (on 128-х cores)
+    ```
 
 * It's really 100% vibe coding ?
   - Yes. QWEN-Coder-Next 80B/3B

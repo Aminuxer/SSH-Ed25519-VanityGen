@@ -25,11 +25,13 @@ or
 pip3 install python3-cryptography
 ```
 
-# Проверка версий
+#### Проверка версий
+```
 python3 -c "import sys; print('Python:', sys.version)"
 python3 -c "import cryptography; print('cryptography:', cryptography.__version__)"
+```
 
-# PIP3-установка
+#### PIP3-установка
 pip3 install "cryptography>=2.5"
 
 

@@ -25,11 +25,13 @@ apt install python3-cryptography
 or 
 pip3 install python3-cryptography
 ```
-# Check versions
+#### Check versions
+```
 python3 -c "import sys; print('Python:', sys.version)"
 python3 -c "import cryptography; print('cryptography:', cryptography.__version__)"
+```
 
-# PIP-install
+#### PIP-install
 pip3 install "cryptography>=2.5"
 
 

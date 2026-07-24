@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 
+
 """
      Ed-25519 SSH Vanity Key Generator [Multi CPU thread, FAST]
      100% AI-Generated: QWEN-Coder-Next 80B/3B
-     Inspired by Aminuxer
-     Version 2026-07-17-cN
+     Inspired by Aminuxer     https://github.com/Aminuxer/SSH-Ed25519-VanityGen
+     Version 2026-07-24-cN
 
 Usage:
     python3 ssh_ed25519_vanity_multicpu.py <pattern> [-i] [-w <workers>] [-o output_file] [--debug]
+    python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns.txt [-i] [-w <workers>] [-o output_prefix] [--debug]
 
 Examples:
     python3 ssh_ed25519_vanity_multicpu.py User -i -w 8
@@ -20,9 +22,9 @@ Options:
     -i          Case-insensitive pattern matching
     -w <N>      Number of worker processes (default: CPU count)
     -o <file>   Save keys to files (output_file.pub and output_file)
+                With --patterns-file: prefix-pattern-YYYYMMDD-HHMMSS
     --debug     Show seed hex in output (for testing/diagnosis)
 """
-
 
 
 import os
@@ -30,9 +32,10 @@ import sys
 import multiprocessing as mp
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import time
 import base64
+import re
 
 # Use monotonic for reliable time measurement
 try:
@@ -43,16 +46,42 @@ except AttributeError:
 # Valid Base64 characters for OpenSSH public key (no padding '=' used)
 B64_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
 
+def format_duration(seconds: float) -> str:
+    """Format duration as days, hours, minutes, seconds"""
+    if seconds < 0:
+        return "0s"
+    days = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+
+    parts = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0 or days > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0 or hours > 0 or days > 0:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+
+    return " ".join(parts)
+
 def validate_pattern(pattern: str) -> bool:
     """Check if pattern contains only valid Base64 characters"""
+    if len(pattern) > 44:
+        return False
     for char in pattern:
         if char not in B64_CHARS:
             return False
     return True
 
-def worker_loop(pattern: str, case_insensitive: bool, result_queue, stop_event, seed_queue, progress_queue, debug_mode: bool):
+def sanitize_filename(name: str) -> str:
+    """Replace invalid filename characters with underscores"""
+    return re.sub(r'[^a-zA-Z0-9\-_.]', '_', name)
+
+def worker_loop(patterns: List[str], case_insensitive: bool, result_queue, stop_event, seed_queue, progress_queue, debug_mode: bool):
     """Worker process that generates keys and checks for pattern"""
-    pattern_lower = pattern.lower() if case_insensitive else pattern
+    pat_checks = [(p, p.lower() if case_insensitive else p) for p in patterns]
     iterations = 0
     last_progress_time = _time_func()
     batch_size = 10000
@@ -81,21 +110,28 @@ def worker_loop(pattern: str, case_insensitive: bool, result_queue, stop_event, 
             # The prefix "AAAAC3NzaC1lZDI1NTE5AAAAI" is always the same (25 chars)
             # We only search in the variable part after the fixed prefix
             variable_part_start = 25  # Position after "AAAAC3NzaC1lZDI1NTE5AAAAI"
-            
+
             iterations += 1
 
-            # Check if pattern matches in the variable part only
+            # Check against all patterns
+            matched_pattern = None
             if len(pubkey_b64) > variable_part_start:
                 search_str = pubkey_b64[variable_part_start:].lower() if case_insensitive else pubkey_b64[variable_part_start:]
             else:
                 search_str = pubkey_b64.lower() if case_insensitive else pubkey_b64
-            if pattern_lower in search_str:
-                # Send both public key and seed (seed always for key reconstruction)
-                # First send remaining iterations, then found result
+
+            for pat, pat_chk in pat_checks:
+                if pat_chk in search_str:
+                    matched_pattern = pat
+                    break
+
+            if matched_pattern:
+                # Send both public key, seed and matched pattern
                 if iterations > 0:
                     progress_queue.put(iterations)
-                result_queue.put(('found', (public_str, seed.hex())))
-                return
+                result_queue.put(('found', (matched_pattern, public_str, seed.hex())))
+                iterations = 0  # Reset counter, DO NOT return. Keep searching for other patterns.
+                # continue to next key
 
             # Check progress by time - send every 5 seconds of wall-clock time
             current_time = _time_func()
@@ -110,40 +146,29 @@ def worker_loop(pattern: str, case_insensitive: bool, result_queue, stop_event, 
 
     result_queue.put(('done', iterations))
 
-def generate_vanity_key(pattern: str, case_insensitive: bool = False,
+def generate_vanity_key(patterns: List[str], case_insensitive: bool = False,
                         num_workers: Optional[int] = None,
                         output_file: Optional[str] = None,
-                        debug_mode: bool = False) -> Optional[Tuple[str, str, int]]:
+                        debug_mode: bool = False) -> Optional[Tuple[str, str, int, float]]:
     """
     Generate ED25519 vanity key with multi-threading
 
     Args:
-        pattern: Pattern to search for in base64 part of public key
+        patterns: List of patterns to search for
         case_insensitive: If True, ignore case when matching pattern
         num_workers: Number of worker processes (default: CPU count)
         output_file: If provided, save keys to files
         debug_mode: If True, show seed hex in output
 
     Returns:
-        Tuple of (public_key_string, private_key_pem, total_iterations) or None if failed
+        Tuple of (public_key_string, private_key_pem, total_iterations, avg_rate) or None if failed
     """
-    pattern_len = len(pattern)
-    if pattern_len > 44:
-        print("[-] Pattern too long (max 44 chars)")
+    if not patterns:
+        print("[-] No valid patterns to search for")
         return None
 
-    if pattern_len == 0:
-        print("[-] Pattern cannot be empty")
-        return None
-
-    # Validate pattern contains only valid Base64 characters
-    if not validate_pattern(pattern):
-        invalid_chars = set(pattern) - B64_CHARS
-        print(f"[-] Pattern contains invalid characters: {sorted(invalid_chars)}")
-        print(f"    Valid Base64 characters: A-Za-z0-9+/")
-        return None
-
-    print(f"[*] Searching for pattern: {pattern}")
+    # 1). Вывод списка принятых паттернов
+    print(f"[*] Accepted patterns: {', '.join(patterns)}")
     print(f"[*] Case insensitive: {case_insensitive}")
     print(f"[*] Debug mode: {debug_mode}")
 
@@ -153,7 +178,10 @@ def generate_vanity_key(pattern: str, case_insensitive: bool = False,
     print(f"[*] Using {num_workers} worker processes")
 
     # Use spawn start method for better compatibility
-    mp.set_start_method('spawn', force=True)
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
 
     # Create Queues and Events
     result_queue = mp.Queue()
@@ -168,13 +196,12 @@ def generate_vanity_key(pattern: str, case_insensitive: bool = False,
     # Start worker processes
     workers = []
     for _ in range(num_workers):
-        p = mp.Process(target=worker_loop, args=(pattern, case_insensitive, result_queue, stop_event, seed_queue, progress_queue, debug_mode))
+        p = mp.Process(target=worker_loop, args=(patterns, case_insensitive, result_queue, stop_event, seed_queue, progress_queue, debug_mode))
         p.start()
         workers.append(p)
 
     # Monitor progress and collect results
     total_iterations = 0
-    found_result = None
     start_time = _time_func()
     last_progress_time = _time_func()
     last_progress_iter = 0
@@ -182,59 +209,114 @@ def generate_vanity_key(pattern: str, case_insensitive: bool = False,
     first_progress_printed = False
     current_progress_line = ""
 
+    # Track remaining patterns
+    remaining = set(patterns)
+    last_found_pub = None
+    last_found_pem = None
+
     try:
-        while True:
+        while remaining:
+            # Always drain progress queue to keep total_iterations accurate
+            while True:
+                try:
+                    total_iterations += progress_queue.get_nowait()
+                except:
+                    break
+
             try:
                 msg_type, data = result_queue.get(timeout=5)
-
-                if msg_type == 'found':
-                    found_result = data
-                    # Drain progress queue to get all accumulated iterations
-                    try:
-                        while True:
-                            delta = progress_queue.get_nowait()
-                            total_iterations += delta
-                    except:
-                        pass
-                    break
-                elif msg_type == 'error':
-                    print(f"[-] Worker error: {data}")
-                    break
-                elif msg_type == 'done':
-                    total_iterations += data
-
             except mp.queues.Empty:
-                # Check progress from progress_queue
-                try:
-                    while True:
-                        delta = progress_queue.get_nowait()
-                        total_iterations += delta
-                except:
-                    pass
-
-                # Debug: show what we have
-                # print(f"DEBUG: elapsed={elapsed:.1f}, total={total_iterations}, last_iter={last_progress_iter}", file=sys.stderr)
-                # sys.stderr.flush()
-
                 # Print progress every 5 seconds (without newline in same line)
                 current_time = _time_func()
                 elapsed_total = current_time - start_time
                 elapsed_interval = current_time - last_progress_time
-                if elapsed_interval >= 5:
+                if elapsed_interval >= 5.0:
                     if total_iterations > last_progress_iter:
                         rate = (total_iterations - last_progress_iter) / elapsed_interval
                         last_rate = rate
-                        current_progress_line = f"\r[+] Progress: {total_iterations:,} keys ({format_duration(elapsed_total)}) (avg ~{rate:,.0f} keys/sec)"
+                        rem_info = f" ({len(remaining)} left)" if remaining else ""
+                        current_progress_line = f"\r[+] Progress: {total_iterations:,} keys ({format_duration(elapsed_total)}) (avg ~{rate:,.0f} keys/sec){rem_info}"
                     else:
-                        current_progress_line = f"\r[+] Progress: {total_iterations:,} keys ({format_duration(elapsed_total)}) (no new keys)"
+                        rem_info = f" ({len(remaining)} left)" if remaining else ""
+                        current_progress_line = f"\r[+] Progress: {total_iterations:,} keys ({format_duration(elapsed_total)}) (no new keys){rem_info}"
                     print(current_progress_line, end="", flush=True)
                     last_progress_time = current_time
                     last_progress_iter = total_iterations
                     first_progress_printed = True
+                continue
 
-            except Exception as e:
-                print(f"[+] Monitoring error: {e}")
+            if msg_type == 'found':
+                matched_pat, public_str, seed_hex = data
+                if matched_pat in remaining:
+                    remaining.remove(matched_pat)
+
+                    # Clear progress line
+                    if first_progress_printed and current_progress_line:
+                        print("\r" + " " * len(current_progress_line) + "\r", end="", flush=True)
+
+                    elapsed_total = _time_func() - start_time
+                    print(f"\n[+] Found match for '{matched_pat}'!")
+                    print(f"[+] Public key: {public_str} {matched_pat}")
+                    if debug_mode:
+                        print(f"[+] Seed (hex): {seed_hex}")
+
+                    # Generate private key immediately
+                    seed = bytes.fromhex(seed_hex)
+                    private_key = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
+                    private_pem_bytes = private_key.private_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PrivateFormat.OpenSSH,
+                        encryption_algorithm=serialization.NoEncryption()
+                    )
+
+                    # Вставка комментария после строки BEGIN
+                    private_pem_str = private_pem_bytes.decode()
+                    date_str = time.strftime("%Y-%m-%d__%T")
+                    comment_line = f"# Generated by Aminuxer & AI SSH-Ed25519-VanityGen; Pattern {matched_pat}; Date {date_str}\n"
+                    lines = private_pem_str.splitlines()
+                    # lines.insert(1, comment_line)
+                    private_pem_mod = "\n".join(lines) + "\n"
+
+                    last_found_pub = public_str
+                    last_found_pem = private_pem_mod
+
+                    # Безопасное сохранение с фолбэком в консоль
+                    saved_successfully = False
+                    if output_file:
+                        try:
+                            ts = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+                            safe_pat = sanitize_filename(matched_pat)
+                            base_name = f"{output_file}-{safe_pat}-{ts}"
+                            output_dir = os.path.dirname(output_file) if os.path.dirname(output_file) else '.'
+
+                            if not os.path.isdir(output_dir):
+                                raise FileNotFoundError(f"Directory does not exist: {output_dir}")
+                            if not os.access(output_dir, os.W_OK):
+                                raise PermissionError(f"Cannot write to directory: {output_dir}")
+
+                            with open(base_name + '.pub', 'w') as f:
+                                f.write(public_str + ' '+ matched_pat + '\n')
+                            with open(base_name, 'w') as f:
+                                f.write(private_pem_mod)
+                            os.chmod(base_name, 0o600)
+                            print(f"[+] Written: {base_name}.pub and {base_name} (mode 600)")
+                            saved_successfully = True
+                        except Exception as e:
+                            print(f"[-] Warning: Failed to save files: {e}")
+
+                    if not saved_successfully:
+                        print("[!] Output to console (file save skipped or failed):")
+                        print(private_pem_mod)
+
+                    print("[*] Continuing search for remaining patterns...")
+                    if not remaining:
+                        break
+
+            elif msg_type == 'error':
+                print(f"[-] Worker error: {data}")
                 break
+            elif msg_type == 'done':
+                total_iterations += data
 
     except KeyboardInterrupt:
         print("\n[!] Interrupted by user")
@@ -252,99 +334,26 @@ def generate_vanity_key(pattern: str, case_insensitive: bool = False,
         print()  # Newline after progress bar
 
     # Print final stats
-    if found_result:
-        public_str, seed_hex = found_result
-        # Clear any remaining progress line
-        if first_progress_printed and current_progress_line:
-            print()  # Newline after progress bar
-        print(f"\n[+] Found match!")
-        print(f"[+] Pattern: {pattern}")
-        print(f"[+] Public key: {public_str}")
-        # Only show seed in debug mode
-        if debug_mode:
-            print(f"[+] Seed (hex): {seed_hex}")
-        # Calculate and show average rate using last_rate if available
+    if last_found_pub:
         elapsed_total = _time_func() - start_time
-        rate = last_rate if last_rate > 0 else (total_iterations / elapsed_total if elapsed_total > 0 else 0)
-        print(f"[+] Checked keys: {total_iterations:,} (avg ~{rate:,.0f} keys/sec)")
-        # Generate private key from seed (always available in result)
-        seed = bytes.fromhex(seed_hex)
-        private_key = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
-        private_pem = private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.OpenSSH,
-            encryption_algorithm=serialization.NoEncryption()
-        )
-        print("\n" + private_pem.decode())
-
-        # Write to files if output_file specified
-        if output_file:
-            # Validate output file path first
-            output_dir = os.path.dirname(output_file) if os.path.dirname(output_file) else '.'
-            if not os.path.isdir(output_dir):
-                raise FileNotFoundError(f"Directory does not exist: {output_dir}")
-
-            # Check write permission
-            if not os.access(output_dir, os.W_OK):
-                raise PermissionError(f"Cannot write to directory: {output_dir}")
-
-            # Public key file
-            try:
-                with open(output_file + '.pub', 'w') as f:
-                    f.write(public_str + '\n')
-            except (IOError, OSError) as e:
-                raise IOError(f"Failed to write public key file: {output_file}.pub - {e}")
-            print(f"[+] Written: {output_file}.pub")
-
-            # Private key file
-            try:
-                with open(output_file, 'w') as f:
-                    f.write(private_pem.decode())
-                os.chmod(output_file, 0o600)
-            except (IOError, OSError) as e:
-                raise IOError(f"Failed to write private key file: {output_file} - {e}")
-            print(f"[+] Written: {output_file} (mode 600)")
-
-        return public_str, private_pem.decode(), total_iterations, last_rate
+        avg_rate = total_iterations / elapsed_total if elapsed_total > 0 else 0
+        print(f"\n[+] Checked keys: {total_iterations:,} (avg ~{avg_rate:,.0f} keys/sec)")
+        return last_found_pub, last_found_pem, total_iterations, avg_rate
     else:
-        # Ensure we print a final newline after progress if it was overwritten
-        if first_progress_printed and current_progress_line:
-            print()  # Newline after progress bar
         elapsed = _time_func() - last_progress_time if 'last_progress_time' in locals() else 0
-        # For very fast searches (< 5 seconds), total_iterations might be 0 if workers
-        # didn't have time to send progress data. At minimum, we checked at least 1 key.
         if total_iterations == 0:
             total_iterations = 1
-        # Use last_rate from progress if available, otherwise calculate from total
         if total_iterations > 0 and elapsed > 0:
             rate = last_rate if last_rate > 0 else total_iterations / elapsed
             print(f"[+] Search completed. Total iterations: {total_iterations:,} (avg ~{rate:,.0f} keys/sec)")
         else:
             print(f"[+] Search completed. Total iterations: {total_iterations:,}")
-
-def format_duration(seconds: float) -> str:
-    """Format duration as days, hours, minutes, seconds"""
-    if seconds < 0:
-        return "0s"
-    days = int(seconds // 86400)
-    hours = int((seconds % 86400) // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-
-    parts = []
-    if days > 0:
-        parts.append(f"{days}d")
-    if hours > 0 or days > 0:
-        parts.append(f"{hours}h")
-    if minutes > 0 or hours > 0 or days > 0:
-        parts.append(f"{minutes}m")
-    parts.append(f"{secs}s")
-
-    return " ".join(parts)
+        return None
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or '--help' in sys.argv or '-h' in sys.argv:
         print("Usage: ssh_ed25519_vanity_multicpu.py <pattern> [-i] [-w <workers>] [-o output_file] [--debug]")
+        print("Usage: ssh_ed25519_vanity_multicpu.py --patterns-file <pattern-file.txt> [-i] [-w <workers>] [-o output_filesnames_prefix] [--debug]")
         print()
         print("Examples:")
         print("    python3 ssh_ed25519_vanity_multicpu.py User -i -w 8")
@@ -360,15 +369,19 @@ if __name__ == "__main__":
         print("    --debug     Show seed hex in output (for testing/diagnosis)")
         sys.exit(0)
 
-    pattern = sys.argv[1]
+    pattern = None
+    patterns_file = None
     case_insensitive = '-i' in sys.argv
     debug_mode = '--debug' in sys.argv
     num_workers = None
     output_file = None
 
-    i = 2
+    i = 1
     while i < len(sys.argv):
-        if sys.argv[i] == '-w' and i + 1 < len(sys.argv):
+        if sys.argv[i] == '--patterns-file' and i + 1 < len(sys.argv):
+            patterns_file = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i] == '-w' and i + 1 < len(sys.argv):
             try:
                 num_workers = int(sys.argv[i + 1])
                 i += 2
@@ -383,19 +396,49 @@ if __name__ == "__main__":
         elif sys.argv[i].startswith('-'):
             i += 1
         else:
+            if pattern is None:
+                pattern = sys.argv[i]
             i += 1
+
+    # Build pattern list
+    valid_patterns = []
+    if patterns_file:
+        if not os.path.isfile(patterns_file):
+            print(f"[-] Patterns file not found: {patterns_file}")
+            sys.exit(1)
+        with open(patterns_file, 'r') as f:
+            lines = [line.strip() for line in f if line.strip()]
+        for line in lines:
+            if validate_pattern(line):
+                valid_patterns.append(line)
+            else:
+                print(f"[-] Warning: Skipping invalid pattern: '{line}'")
+    elif pattern:
+        if validate_pattern(pattern):
+            valid_patterns.append(pattern)
+        else:
+            print(f"[-] Invalid pattern: '{pattern}'")
+            sys.exit(1)
+    else:
+        print("[-] No pattern or patterns-file provided")
+        sys.exit(1)
+
+    # Предварительная проверка каталога вывода
+    if output_file:
+        out_dir = os.path.dirname(output_file) if os.path.dirname(output_file) else '.'
+        if not os.path.isdir(out_dir):
+            print(f"[-] Warning: Output directory does not exist: {out_dir}. Keys will be printed to console.")
+        elif not os.access(out_dir, os.W_OK):
+            print(f"[-] Warning: No write permission for output directory: {out_dir}. Keys will be printed to console.")
 
     # Start timing
     start_time = _time_func()
-    result = generate_vanity_key(pattern, case_insensitive, num_workers, output_file, debug_mode)
+    result = generate_vanity_key(valid_patterns, case_insensitive, num_workers, output_file, debug_mode)
 
     if result:
         duration = _time_func() - start_time
         public_str, private_pem, total_iterations, last_rate = result
-        # For very fast searches (< 5 seconds), total_iterations might be 0 if workers
-        # didn't have time to send progress data. At minimum, we found 1 key.
         if total_iterations == 0:
             total_iterations = 1
         print(f"[+] Total time: {format_duration(duration)}")
         print(f"[+] Checked keys: {total_iterations:,}")
-

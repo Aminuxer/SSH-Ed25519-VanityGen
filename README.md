@@ -14,6 +14,9 @@ Python-3 multithreaded version. Load only CPU cores.
 ## Installation and requirements
 
 0). Dependencies;
+Minimal versions: Python 3.6; python3-cryptography 2.5
+
+
 Install python3 package *python3-cryptography* with OS package manager or over pip3 tool.
 ```
 dnf install python3-cryptography
@@ -22,6 +25,13 @@ apt install python3-cryptography
 or 
 pip3 install python3-cryptography
 ```
+# Check versions
+python3 -c "import sys; print('Python:', sys.version)"
+python3 -c "import cryptography; print('cryptography:', cryptography.__version__)"
+
+# PIP-install
+pip3 install "cryptography>=2.5"
+
 
 1). Run command for generate key:
 On CPU only:
@@ -32,54 +42,101 @@ python3 ssh_ed25519_vanity_multicpu.py User
 Example output
 
 ```
-[*] Searching for pattern: User
+[*] Accepted patterns: User
 [*] Case insensitive: False
+[*] Debug mode: False
 [*] Using 8 worker processes
 
-[+] Found match!
-[+] Pattern: User                                                                    \    /
-[+] Public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOgoT3M3vgzd9RuPqE4cS5v8xdjtHbY8CKUserCvVGxc
-[+] Seed (hex): 3c0ddad9f6b80269a290818270fc5480952deada4f067f8468425e021aef25e4     /    \
-
+[+] Found match for 'User'!                                                          \    /
+[+] Public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOgoT3M3vgzd9RuPqE4cS5v8xdjtHbY8CKUserCvVGxc User
+[!] Output to console (file save skipped or failed):                                 /    \
 -----BEGIN OPENSSH PRIVATE KEY-----
 ...
 -----END OPENSSH PRIVATE KEY-----
 
-[+] Total time: 5s
+[*] Continuing search for remaining patterns...
+
+[+] Checked keys: 3208 (avg ~1152 keys/sec)
+[+] Total time: 15s
+[+] Checked keys: 3208
 ```
 
 ## Options
-*-i* : Case insensitivity.
-*-w* : Workers (thread) count. By default = count of CPU cores.
-*-o* : Output file(s) for founded key.
-Options must be specified after pattern.
+_-i_ : Case insensitivity.
+_-w_ : Workers (thread) count. By default = count of CPU cores.
+_-o_ : Output filename prefix for founded key(s).
+_--debug_ : Print HEX-seed private bytes for debug.
+_--patterns-file_ : Text file with patterns, one per string
+
+Options must be specified after pattern of pattern-file.
 Example command:
 ```
 python3 ssh_ed25519_vanity_multicpu.py User -w 6 -i -o user_key
 ```
 Example Output:
 ```
-[*] Searching for pattern: User
+[*] Accepted patterns: User
 [*] Case insensitive: True
-[*] Using 6 worker processes
+[*] Debug mode: False
+[*] Using 8 worker processes
 
-[+] Found match!
-[+] Pattern: User                                                                     \    /
+[+] Found match for 'User'!                                                           \    /
 [+] Public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINjlM36Apehfaws+7SePQQXLha1142WsZlsuSerI7+r+
-[+] Seed (hex): 4e068d11efbd54912780f29426008c5c0f6d6aed3e2852e8266dd67512d89e0d      /    \
+[+] Written: user_key-User-202607....pub and user-key-User-202607...                  /    \
+[*] Continuing search for remaining patterns...
 
------BEGIN OPENSSH PRIVATE KEY-----
-...
------END OPENSSH PRIVATE KEY-----
-
-[+] Written: user_key.pub
-[+] Written: user_key (mode 600)
-[+] Total time: 0s
+[+] Checked keys: 1254 (avg ~1589 keys/sec)
+[+] Total time: 20s
+[+] Checked keys: 1254
 ```
+
+Multi-patterns example:
+```
+cat patterns-list.txt
+Use+
+USE+
+Use-
+-US-
+/US+
+```
+
+Example output:
+```
+python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
+[-] Warning: Skipping invalid pattern: 'Use-'
+[-] Warning: Skipping invalid pattern: '-US-'
+[*] Accepted patterns: Use+, USE+, /US+
+[*] Case insensitive: False
+[*] Debug mode: False
+[*] Using 8 worker processes
+
+[+] Found match for 'Use+'!                                                  \    /
+[+] Public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDy5zVZ/dic/CYpAA+JRFJvC+NUse+Z/Z3yXJdwMkGiS Use+
+[+] Written: KEYS-Use_-2026....pub and KEYS-Use_-2026... (mode 600)
+[*] Continuing search for remaining patterns...
+
+[+] Found match for '/US+'!                                 \   /
+[+] Public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFrJnfh1/US+XNiYaNJXMFv9ytKxUuJmSeYx7nv1yuMx /US+
+[+] Written: KEYS-_US_-2026....pub and KEYS-_US_-2026... (mode 600)
+[*] Continuing search for remaining patterns...
+
+[+] Found match for 'USE+'!                                                              \    /
+[+] Public key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBkZmpR+3nmBzrATC1lYcPSJUnb/OZBfOkNIWCUSE+nz USE+
+[+] Written: KEYS-USE_-2026....pub and KEYS-USE_-2026... (mode 600)
+[*] Continuing search for remaining patterns...
+
+[+] Checked keys: 35,004 (avg ~6,903 keys/sec)
+[+] Total time: 5s
+[+] Checked keys: 35,004
+```
+
 
 ##  FAQ
 * Can i specify more workers then vCPU ?
   - Yes. You can try different variants.
+
+* Will be RegExp support added for patterns ?
+  - No. Too slow function.
 
 * How fast keys checked ?
     ```

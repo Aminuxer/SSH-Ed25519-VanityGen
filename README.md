@@ -151,7 +151,7 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
   - You can calucate math-estimate by formula :
      C = ( ln(1/(1‑P)) * 64^N ) / ( 44‑N+1 )
     
-     $$ \( C = \frac{64^{N} \ln \bigl(\frac{1}{1-P}\bigr)}{44 - N + 1} \) $$
+     $$ C = \frac{64^{N} \ln \bigl(\frac{1}{1-P}\bigr)}{44 - N + 1} $$
     
      Table with estimated keys count for target probability:
 

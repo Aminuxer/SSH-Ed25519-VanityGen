@@ -148,9 +148,12 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
     ~ 550 000 keys/sec  AMD EPYC 9334 (on 128-х cores)
     ```
 * How many keys need brute until found key ?
-  - You can calucate math-estimate by formula C = ( ln(1/(1‑P)) * 64^N ) / ( 44‑N+1 )   :
-$' \( C = \frac{64^{N}\,\ln\!\bigl(\frac{1}{1-P}\bigr)}{44 - N + 1} \) '$
-Table with estimated keys count for target probability:
+  - You can calucate math-estimate by formula :
+     C = ( ln(1/(1‑P)) * 64^N ) / ( 44‑N+1 )
+    
+     $ \( C = \frac{64^{N}\,\ln\!\bigl(\frac{1}{1-P}\bigr)}{44 - N + 1} \) $
+    
+     Table with estimated keys count for target probability:
 
 | N \ P | 50 | 90 | 99 | 99,9 |
 ---|---|---|---|---|

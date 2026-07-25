@@ -149,9 +149,9 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
     ```
 * How many keys need brute until found key ?
   - You can calucate math-estimate by formula :
-     C = ( ln(1/(1‑P)) * 64^N ) / ( 44‑N+1 )
+     C = ( ln(1/(1‑P)) * 64^N ) / ( 45‑N )
     
-     $$ C = \frac{64^{N} \ln \bigl(\frac{1}{1-P}\bigr)}{44 - N + 1} $$
+     $$ C = \frac{64^{N} \ln \bigl(\frac{1}{1-P}\bigr)}{45 - N} $$
     
      Table with estimated keys count for target probability:
 
@@ -172,5 +172,5 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
   - Yes. QWEN-Coder-Next 80B/3B
 
 * What's about cryprographic reliability ?
-  - Rely on Ed25519 and puython3 os.urandom() quality.
+  - Rely on Ed25519 and python3 os.urandom() quality.
 

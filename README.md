@@ -149,10 +149,11 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
     ```
 * How many keys need brute until found key ?
   - You can calucate math-estimate by formula C = ( ln(1/(1‑P)) * 64^N ) / ( 44‑N+1 )   :
-  \( C = \frac{64^{N}\,\ln\!\bigl(\frac{1}{1-P}\bigr)}{44 - N + 1} \)
+$' \( C = \frac{64^{N}\,\ln\!\bigl(\frac{1}{1-P}\bigr)}{44 - N + 1} \) '$
 Table with estimated keys count for target probability:
+
 | N \ P | 50 | 90 | 99 | 99,9 |
-|---|---|---|---|---|
+---|---|---|---|---|
 | 2 | 66 | 219 | 439 | 658 |
 | 3 | 4326 | 14372 | 28743 | 43115 |
 | 4 | 283636 | 942219 | 1884437 | 2826656 |

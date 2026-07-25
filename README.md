@@ -147,10 +147,26 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
     ~ 130 000 keys/sec Xeon(R) CPU E5-2670 0 @ 2.60GHz (on 20-х cores)
     ~ 550 000 keys/sec  AMD EPYC 9334 (on 128-х cores)
     ```
+* How many keys need brute until found key ?
+  - You can calucate math-estimate by formula C = ( ln(1/(1‑P)) * 64^N ) / ( 44‑N+1 )   :
+  \( C = \frac{64^{N}\,\ln\!\bigl(\frac{1}{1-P}\bigr)}{44 - N + 1} \)
+Table with estimated keys count for target probability:
+| N \ P | 50 | 90 | 99 | 99,9 |
+|---|---|---|---|---|
+| 2 | 66 | 219 | 439 | 658 |
+| 3 | 4326 | 14372 | 28743 | 43115 |
+| 4 | 283636 | 942219 | 1884437 | 2826656 |
+| 5 | 18606528 | 61809548 | 123619096 | 185428644 |
+| 6 | 1221351578 | 4057242121 | 8114484243 | 12171726364 |
+| 7 | 80223514188 | 266496745652 | 532993491303 | 799490236955 |
+| 8 | 5273069905545 | 17516759065535 | 35033518131070 | 52550277196607 |
+| 9 | 346850820453631 | 1152213485199650 | 2304426970399298 | 3456640455599000 |
+| 10 | 22832694009290500 | 75848567711428400 | 151697135422857000 | 227545703134289000 |
+
 
 * It's really 100% vibe coding ?
   - Yes. QWEN-Coder-Next 80B/3B
 
-* What's about cpyprographic reliability ?
+* What's about cryprographic reliability ?
   - Rely on Ed25519 and puython3 os.urandom() quality.
 

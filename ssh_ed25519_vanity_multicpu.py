@@ -26,7 +26,6 @@ Options:
 """
 
 
-
 import os
 import sys
 import multiprocessing as mp
@@ -35,7 +34,6 @@ from cryptography.hazmat.primitives import serialization
 from typing import Optional, Tuple, List
 import time
 import re
-
 
 
 # Use monotonic for reliable time measurement
@@ -94,7 +92,7 @@ def worker_loop(patterns: List[str], case_insensitive: bool, result_queue, stop_
     pat_checks = [(p, p.lower() if case_insensitive else p) for p in patterns]
     iterations = 0
     last_progress_time = _time_func()
-    batch_size = 10000
+    batch_size = 1024768
 
     while not stop_event.is_set():
         try:

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 
-
 """
      Ed-25519 SSH Vanity Key Generator [Multi CPU thread, FAST]
      100% AI-Generated: QWEN-Coder-Next 80B/3B
      Inspired by Aminuxer     https://github.com/Aminuxer/SSH-Ed25519-VanityGen
-     Version 2026-07-24-cN
+     Version 2026-07-30--N-CPU
 
 Usage:
     python3 ssh_ed25519_vanity_multicpu.py <pattern> [-i] [-w <workers>] [-o output_file] [--debug]
@@ -27,6 +26,7 @@ Options:
 """
 
 
+
 import os
 import sys
 import multiprocessing as mp
@@ -34,8 +34,9 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
 from typing import Optional, Tuple, List
 import time
-import base64
 import re
+
+
 
 # Use monotonic for reliable time measurement
 try:
@@ -43,8 +44,10 @@ try:
 except AttributeError:
     _time_func = time.time
 
+
 # Valid Base64 characters for OpenSSH public key (no padding '=' used)
 B64_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+
 
 def format_duration(seconds: float) -> str:
     """Format duration as days, hours, minutes, seconds"""
@@ -66,6 +69,7 @@ def format_duration(seconds: float) -> str:
 
     return " ".join(parts)
 
+
 def validate_pattern(pattern: str) -> bool:
     """Check if pattern contains only valid Base64 characters"""
     if len(pattern) > 44:
@@ -75,12 +79,18 @@ def validate_pattern(pattern: str) -> bool:
             return False
     return True
 
+
 def sanitize_filename(name: str) -> str:
     """Replace invalid filename characters with underscores"""
     return re.sub(r'[^a-zA-Z0-9\-_.]', '_', name)
 
-def worker_loop(patterns: List[str], case_insensitive: bool, result_queue, stop_event, seed_queue, progress_queue, debug_mode: bool):
-    """Worker process that generates keys and checks for pattern"""
+
+def worker_loop(patterns: List[str], case_insensitive: bool, result_queue, stop_event, progress_queue, debug_mode: bool):
+    """Worker process that generates keys sequentially from a random starting seed"""
+    # Initialization: one truly random seed per worker
+    current_seed_int = int.from_bytes(os.urandom(32), 'big')
+    max_seed = (1 << 256) - 1  # 2^256 - 1
+
     pat_checks = [(p, p.lower() if case_insensitive else p) for p in patterns]
     iterations = 0
     last_progress_time = _time_func()
@@ -88,14 +98,12 @@ def worker_loop(patterns: List[str], case_insensitive: bool, result_queue, stop_
 
     while not stop_event.is_set():
         try:
-            # Get seed from queue if not empty, otherwise generate random
-            try:
-                seed = seed_queue.get_nowait()
-            except:
-                seed = os.urandom(32)
+            # Sequential seed increment (faster than os.urandom)
+            current_seed_int = (current_seed_int + 1) & max_seed
+            seed_bytes = current_seed_int.to_bytes(32, 'big')
 
             # Generate ED25519 key from seed
-            private_key = ed25519.Ed25519PrivateKey.from_private_bytes(seed)
+            private_key = ed25519.Ed25519PrivateKey.from_private_bytes(seed_bytes)
             public_key = private_key.public_key()
 
             # Get public key in OpenSSH format (base64 part only)
@@ -126,10 +134,9 @@ def worker_loop(patterns: List[str], case_insensitive: bool, result_queue, stop_
                     break
 
             if matched_pattern:
-                # Send both public key, seed and matched pattern
                 if iterations > 0:
                     progress_queue.put(iterations)
-                result_queue.put(('found', (matched_pattern, public_str, seed.hex())))
+                result_queue.put(('found', (matched_pattern, public_str, seed_bytes.hex())))
                 iterations = 0  # Reset counter, DO NOT return. Keep searching for other patterns.
                 # continue to next key
 
@@ -146,12 +153,13 @@ def worker_loop(patterns: List[str], case_insensitive: bool, result_queue, stop_
 
     result_queue.put(('done', iterations))
 
+
 def generate_vanity_key(patterns: List[str], case_insensitive: bool = False,
                         num_workers: Optional[int] = None,
                         output_file: Optional[str] = None,
                         debug_mode: bool = False) -> Optional[Tuple[str, str, int, float]]:
     """
-    Generate ED25519 vanity key with multi-threading
+    Generate ED25519 vanity key with multi-processing & sequential seeding
 
     Args:
         patterns: List of patterns to search for
@@ -167,7 +175,7 @@ def generate_vanity_key(patterns: List[str], case_insensitive: bool = False,
         print("[-] No valid patterns to search for")
         return None
 
-    # 1). Вывод списка принятых паттернов
+    # 1). Output accepted patterns
     print(f"[*] Accepted patterns: {', '.join(patterns)}")
     print(f"[*] Case insensitive: {case_insensitive}")
     print(f"[*] Debug mode: {debug_mode}")
@@ -186,17 +194,14 @@ def generate_vanity_key(patterns: List[str], case_insensitive: bool = False,
     # Create Queues and Events
     result_queue = mp.Queue()
     stop_event = mp.Event()
-    seed_queue = mp.Queue()
     progress_queue = mp.Queue()
-
-    # Pre-fill seed queue with random seeds
-    for _ in range(num_workers * 100):
-        seed_queue.put(os.urandom(32))
+    # seed_queue completely removed
 
     # Start worker processes
     workers = []
     for _ in range(num_workers):
-        p = mp.Process(target=worker_loop, args=(patterns, case_insensitive, result_queue, stop_event, seed_queue, progress_queue, debug_mode))
+        # seed_queue removed from arguments
+        p = mp.Process(target=worker_loop, args=(patterns, case_insensitive, result_queue, stop_event, progress_queue, debug_mode))
         p.start()
         workers.append(p)
 
@@ -269,7 +274,6 @@ def generate_vanity_key(patterns: List[str], case_insensitive: bool = False,
                         encryption_algorithm=serialization.NoEncryption()
                     )
 
-                    # Вставка комментария после строки BEGIN
                     private_pem_str = private_pem_bytes.decode()
                     date_str = time.strftime("%Y-%m-%d__%T")
                     comment_line = f"# Generated by Aminuxer & AI SSH-Ed25519-VanityGen; Pattern {matched_pat}; Date {date_str}\n"
@@ -280,7 +284,7 @@ def generate_vanity_key(patterns: List[str], case_insensitive: bool = False,
                     last_found_pub = public_str
                     last_found_pem = private_pem_mod
 
-                    # Безопасное сохранение с фолбэком в консоль
+                    # Safe file save with console fallback
                     saved_successfully = False
                     if output_file:
                         try:
@@ -349,6 +353,7 @@ def generate_vanity_key(patterns: List[str], case_insensitive: bool = False,
         else:
             print(f"[+] Search completed. Total iterations: {total_iterations:,}")
         return None
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or '--help' in sys.argv or '-h' in sys.argv:
@@ -423,7 +428,7 @@ if __name__ == "__main__":
         print("[-] No pattern or patterns-file provided")
         sys.exit(1)
 
-    # Предварительная проверка каталога вывода
+    # Preliminary check of output directory
     if output_file:
         out_dir = os.path.dirname(output_file) if os.path.dirname(output_file) else '.'
         if not os.path.isdir(out_dir):
@@ -442,3 +447,4 @@ if __name__ == "__main__":
             total_iterations = 1
         print(f"[+] Total time: {format_duration(duration)}")
         print(f"[+] Checked keys: {total_iterations:,}")
+

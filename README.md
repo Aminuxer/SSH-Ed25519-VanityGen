@@ -64,11 +64,17 @@ Example output
 ```
 
 ## Options
+
 _-i_ : Case insensitivity.
+
 _-w_ : Workers (thread) count. By default = count of CPU cores.
+
 _-o_ : Output filename prefix for founded key(s).
+
 _--debug_ : Print HEX-seed private bytes for debug.
+
 _--patterns-file_ : Text file with patterns, one per string
+
 
 Options must be specified after pattern of pattern-file.
 Example command:

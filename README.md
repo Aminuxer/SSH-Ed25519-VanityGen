@@ -141,12 +141,20 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
   - No. Too slow function.
 
 * How fast keys checked ?
-    ```
-    ~ 30 000 keys/sec Celeron G9300 2.80 GHz (on 2-x cores).
-    ~ 45 000 keys/sec Core-i7 2700K (on 8-x cores).
-    ~ 130 000 keys/sec Xeon(R) CPU E5-2670 0 @ 2.60GHz (on 20-х cores)
-    ~ 550 000 keys/sec  AMD EPYC 9334 (on 128-х cores)
-    ```
+
+| Hardware | Cores used (-w) | Cores ALL | ~ keys per second |
+---|---|---|---|
+| AMD Turion II Neo N40 | 2 | 2 | 8 000 |
+| Raspberry Pi 4 Model B Rev 1.5  | 4 | 4 | 10 000 |
+| Core i5 CPU  650  @ 3.20GHz  | 4 | 4 | 22000 |
+| Celeron G9300 2.80 GH | 2 | 2 | 30 000 |
+| Xeon X3450 2.67GHz | 8 | 8 | 37 000 |
+| AMD Opteron(tm) Processor 2386 SE | 8 | 8 | 44 000 |
+| Core-i7 2700K  | 8 | 8 | 45 000 |
+| Core i7-6700HQ 2.60GHz  | 8  | 8 |  63000  |
+| Xeon CPU E5-2670 2.60GHz  | 20 | 32 | 140 000 |
+| 2x AMD EPYC 9334 3.90 GHz | 128 | 128 | 640 000 |
+
 * How many keys need brute until found key ?
   - You can calucate math-estimate by formula :
      C = ( ln(1/(1‑P)) * 64^N ) / ( 45‑N )

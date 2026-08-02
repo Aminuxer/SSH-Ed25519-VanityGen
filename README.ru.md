@@ -146,7 +146,7 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
 * Как быстро проверяются ключи ?
 
 | Оборудование | Ядер использовано (-w) | Ядер всего | ~ ключей в секунду |
----|---|---|
+---|---|---|---|
 | AMD Turion II Neo N40 | 2 | 2 | 8 000 |
 | Raspberry Pi 4 Model B Rev 1.5  | 4 | 4 | 10 000 |
 | Core i5 CPU  650  @ 3.20GHz  | 4 | 22000 |

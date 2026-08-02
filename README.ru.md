@@ -144,12 +144,19 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
   - Точно нет. Они слишком медленные.
 
 * Как быстро проверяются ключи ?
-    ```
-    ~ 30 тысяч ключей в секунду на двухядерном Celeron G9300 2.80 GHz (on 2-x cores).
-    ~ 45 тысяч ключей в секунду на Core-i7 2700K (on 8-x cores).
-    ~ 130 тысяч ключей в секунду на Xeon(R) CPU E5-2670 0 @ 2.60GHz (on 20-х cores)
-    ~ 550 тысяч ключей в секунду на  AMD EPYC 9334 (on 128-х cores)
-    ```
+| Hardware | Cores Used (-w) | All Cores | ~ Keys/Second |
+---|---|---|
+| AMD Turion II Neo N40 | 2 | 2 | 8 000 |
+| Raspberry Pi 4 Model B Rev 1.5  | 4 | 4 | 10 000 |
+| Core i5 CPU  650  @ 3.20GHz  | 4 | 22000 |
+| Celeron G9300 2.80 GH | 2 | 2 | 30 000 |
+| Xeon X3450 2.67GHz | 8 | 8 | 37 000 |
+| AMD Opteron(tm) Processor 2386 SE | 8 | 8 | 44 000 |
+| Core-i7 2700K  | 8 | 8 | 45 000 |
+| Core i7-6700HQ 2.60GHz  | 8  | 63000  |
+| Xeon CPU E5-2670 2.60GHz  | 20 | 32 | 140 000 |
+| 2x AMD EPYC 9334 3.90 GHz | 128 | 128 | 640 000 |
+|   |   |   |
 
 * Сколько ключей надо перебрать, чтобы найти желаемый ?
   - Можно посчитать мат-ожидание по формуле :

@@ -6,7 +6,7 @@ This project implements an SSH ED25519 vanity key generator using **OpenCL GPU a
 
 - **100% AI-Generated**: QWEN-3.6-27B NVFP4
 - **Inspired by Aminuxer**
-- **Version**: 2026-08-03--N-GPU
+- **Version**: 2026-08-04--N-GPU
 
 ---
 
@@ -17,9 +17,6 @@ This project implements an SSH ED25519 vanity key generator using **OpenCL GPU a
 * python3-numpy
 * python3-cryptography
 * device drivers for OpenCL devices
-
-#### For tests/development:
-* pytools >= 2025.1.12
 
 
 ## Usage
@@ -39,10 +36,13 @@ python3 ssh_ed25519_vanity_gpu_opencl.py --help
 | `-i` | Case-insensitive pattern matching |
 | `-w <workers>` | Number of GPU workers to use (default: number of detected GPUs) |
 | `-o <output_file>` | Save results to file (creates `.pub` for public key, main file for private key) |
+| `--debug` | Display source seed |
 
 GPU-specific options:
-    --opencl-devices a,b,c     Use specific device IDs (ignores -w)
-    --load-percent 1-100       % of GPU cores to use (default: 100)
+```
+  --opencl-devices a,b,c     Use specific device IDs (ignores -w)
+  --load-percent 1-100       % of GPU cores to use (default: 100)
+```
 
 ---
 

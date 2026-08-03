@@ -3,18 +3,6 @@
 import sys, os, hashlib, argparse
 
 try:
-    import importlib.metadata
-    pytools_version = importlib.metadata.version("pytools")
-    pytools_tuple = tuple(int(x) for x in pytools_version.split(".")[:3])
-    if pytools_tuple < (2025, 1, 12):
-        print(f"ERROR: pytools version {pytools_version} is too old")
-        sys.exit(1)
-    print(f"OK: pytools version {pytools_version} is compatible")
-except Exception as e:
-    print(f"ERROR: Failed to check pytools version: {e}")
-    sys.exit(1)
-
-try:
     import pyopencl as cl
     import numpy as np
 except ImportError as e:

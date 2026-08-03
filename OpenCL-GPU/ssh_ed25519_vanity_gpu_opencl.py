@@ -4,7 +4,7 @@
 Ed-25519 SSH Vanity Key Generator [OpenCL GPU]
 Port of ssh_ed25519_vanity_multicpu.py to GPU via OpenCL.
 ** Inspired by Aminuxer
-** Version: 2026-08-03--N-GPU
+** Version: 2026-08-04--N-GPU
 
 Usage:
     python3 ssh_ed25519_vanity_gpu_opencl.py <pattern> [-i] [-w <workers>] [-o output] [--debug]
@@ -74,9 +74,17 @@ def get_all_gpu_devices():
 # ─── GPU Worker ─────────────────────────────────────────────────────────
 
 def worker_gpu(device_idx, patterns, case_insensitive,
-               result_queue, stop_event,
-               found_flags, kernel_path, load_percent):
-    """GPU worker process — runs OpenCL kernel in a loop."""
+                result_queue, stop_event,
+                found_flags, kernel_path, load_percent):
+    """GPU worker process — runs OpenCL kernel in a loop.
+
+    SEED LIFECYCLE:
+      - Random seeds generated ONCE at startup via os.urandom()
+      - Uploaded to GPU READ_WRITE buffer ONCE
+      - Kernel increments each seed by 1 (256-bit LE) after each launch
+      - NO H2D seed transfers in the main loop
+      - On match: kernel writes the matching seed to foundSeeds buffer
+    """
     import traceback
 
     pat_count = len(patterns)
@@ -115,11 +123,8 @@ def worker_gpu(device_idx, patterns, case_insensitive,
         kernel = cl.Kernel(program, 'vanity_search')
 
         # Determine work size
-        # Kernel uses heavy private memory (SHA512 W[80]=640B + Ed25519 stack).
-        # Use small local_size to fit many work-items.
         max_wg = device.get_info(cl.device_info.MAX_WORK_GROUP_SIZE)
         max_cu = device.get_info(cl.device_info.MAX_COMPUTE_UNITS)
-        # Conservative: 32 work-items per group (reduces private mem pressure)
         local_size = 32
         desired_global = int(max_wg * max_cu * load_percent / 100)
         batch_size = (desired_global // local_size) * local_size
@@ -133,68 +138,70 @@ def worker_gpu(device_idx, patterns, case_insensitive,
         result_queue.put(('error', f"GPU init failed: {e}\n{traceback.format_exc()}"))
         return
 
-    # Allocate persistent GPU buffers
+    # ── Allocate persistent GPU buffers ────────────────────────────────
     mf = cl.mem_flags
-    seeds_buf    = cl.Buffer(ctx, mf.READ_WRITE, batch_size * 32)
-    results_buf  = cl.Buffer(ctx, mf.READ_WRITE, batch_size * 4)
-    pubkey_buf   = cl.Buffer(ctx, mf.READ_WRITE, batch_size * 32)
+    seeds_buf     = cl.Buffer(ctx, mf.READ_WRITE, batch_size * 32)
+    results_buf   = cl.Buffer(ctx, mf.READ_WRITE, batch_size * 4)
+    pubkey_buf    = cl.Buffer(ctx, mf.READ_WRITE, batch_size * 32)
+    found_seeds_buf = cl.Buffer(ctx, mf.READ_WRITE, batch_size * 32)
     pat_bytes_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pat_bytes_np)
     pat_lens_buf  = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pat_lens_np)
     pat_ci_buf    = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pat_ci_np)
 
-    seeds_np   = np.zeros(batch_size * 32, dtype=np.uint8)
-    results_np = np.zeros(batch_size, dtype=np.int32)
+    # ── Generate random seeds ONCE and upload ONCE ─────────────────────
+    seeds_np = np.frombuffer(os.urandom(batch_size * 32), dtype=np.uint8)
+    cl.enqueue_copy(queue, seeds_buf, seeds_np, is_blocking=True)
+
+    # Host-side read buffers
+    results_np    = np.empty(batch_size, dtype=np.int32)
+    found_seeds_np = np.empty(batch_size * 32, dtype=np.uint8)
 
     iterations = 0
     last_prog_time = time.monotonic()
-    last_prog_iter = 0
     matched_count = 0
 
     try:
         while not stop_event.is_set():
-            # Generate random seeds
-            seeds_np[:] = np.frombuffer(os.urandom(batch_size * 32), dtype=np.uint8)
-
-            # Upload seeds to GPU
-            cl.enqueue_copy(queue, seeds_buf, seeds_np)
-            queue.finish()
-
-            # Launch kernel
+            # ── Launch kernel (seeds are incremented IN-PLACE on GPU) ──
             kernel.set_args(
                 seeds_buf,
                 np.int32(batch_size),
                 pat_bytes_buf, pat_lens_buf, pat_ci_buf,
                 np.int32(pat_count),
                 results_buf, pubkey_buf,
+                found_seeds_buf,
             )
-            evt = cl.enqueue_nd_range_kernel(queue, kernel,
-                                             (batch_size,),
-                                             (local_size,))
-            evt.wait()
+            cl.enqueue_nd_range_kernel(queue, kernel,
+                                       (batch_size,),
+                                       (local_size,))
 
-            # Download results
+            # ── Download results (async D2H, then sync) ────────────────
             cl.enqueue_copy(queue, results_np, results_buf)
             queue.finish()
 
             iterations += batch_size
 
-            # Check results for matches
-            for i in range(batch_size):
-                pat_idx = results_np[i]
-                if pat_idx >= 0:
+            # ── Check results for matches (vectorized) ─────────────────
+            match_indices = np.where(results_np >= 0)[0]
+            if len(match_indices) > 0:
+                # Download found seeds (only once per batch, not per match)
+                cl.enqueue_copy(queue, found_seeds_np, found_seeds_buf,
+                                is_blocking=True)
+
+                for i in match_indices:
+                    pat_idx = int(results_np[i])
                     try:
-                        # Try to mark as found atomically
                         with found_flags.get_lock():
                             if found_flags[pat_idx] == 0:
                                 found_flags[pat_idx] = 1
                             else:
-                                continue  # already found by another worker
+                                continue
                     except Exception:
                         continue
 
-                    seed_hex = seeds_np[i*32:(i+1)*32].tobytes().hex()
+                    seed_hex = found_seeds_np[i*32:(i+1)*32].tobytes().hex()
                     result_queue.put(('found', {
-                        'pattern_idx': int(pat_idx),
+                        'pattern_idx': pat_idx,
                         'seed': seed_hex,
                         'iterations': iterations,
                     }))
@@ -204,16 +211,16 @@ def worker_gpu(device_idx, patterns, case_insensitive,
             now = time.monotonic()
             if now - last_prog_time >= 5.0:
                 try:
-                    result_queue.put(('progress', batch_size), block=False)
+                    result_queue.put(('progress', iterations - last_prog_iter), block=False)
                 except Exception:
                     pass
                 last_prog_time = now
+                last_prog_iter = iterations
 
     except Exception as e:
         result_queue.put(('error', f"Worker loop error: {e}\n{traceback.format_exc()}"))
     finally:
-        # Cleanup GPU buffers
-        for buf in [seeds_buf, results_buf, pubkey_buf,
+        for buf in [seeds_buf, results_buf, pubkey_buf, found_seeds_buf,
                     pat_bytes_buf, pat_lens_buf, pat_ci_buf]:
             try:
                 buf.release()
@@ -267,8 +274,9 @@ def generate_vanity_key(patterns, case_insensitive=False,
         num_workers = len(selected)
         print(f"[*] Using {num_workers} GPU(s) (selected: {opencl_devices})")
     else:
+        # If num_workers not specified, use ALL available GPUs by default
         if num_workers is None:
-            num_workers = 1
+            num_workers = len(devices)
         num_workers = min(num_workers, len(devices))
         selected = list(range(num_workers))
         print(f"[*] Using {num_workers} GPU(s)")

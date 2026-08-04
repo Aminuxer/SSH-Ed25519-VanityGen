@@ -1,20 +1,30 @@
 // vanity_sshgen.cl — GPU kernel for vanity SSH key search
 // Includes the tested pipeline files:
 //   sha512.cl   — SHA512_H, sha512_transform, little_s0, little_s1
-//   big_math.cl — mod_p_reduce, mul_mod_p, mod_p_inverse, seed_to_scalar, scalar_to_bytes, ...
-//   ed25519.cl  — scalar_mult, point_to_affine_y
+//   big_math.cl — mod_p_reduce, mul_mod_p, mod_p_inverse, scalar_to_bytes
+//   ed25519.cl  — scalar_mult
 //   openssh.cl  — BASE64_TABLE (plus __kernel funcs we don't call here)
 //
-// The kernel (per work-item):
-//   1. SHA512(seed) → expanded[64]
-//   2. Clamp expanded[0..31] → scalar (LE interpretation, RFC 8032)
-//   3. scalar_mult → projective point (Ed25519)
-//   4. point_to_affine_y + sign bit → 32-byte public key
-//   5. Build SSH blob (uint32(11) || "ssh-ed25519" || uint32(32) || pubkey)
-//   6. Base64 encode (51 → 68 chars)
-//   7. Match pattern in variable part (base64[pos 25+])
+// SEED LIFECYCLE:
+//   - CPU generates random seeds ONCE at startup, uploads to GPU (READ_WRITE)
+//   - Each work-item reads its seed, uses it, then increments by 1 (256-bit LE)
+//   - On NEXT kernel launch, the same work-item gets the already-incremented seed
+//   - NO H2D seed transfers in the main loop — seeds live and mutate on GPU
 //
-// Output: results[i] = pattern index (0-based) if matched, -1 otherwise
+// The kernel (per work-item):
+//   1. Load seed from seeds[idx*32..(idx+1)*32]
+//   2. SHA512(seed) → expanded[64]
+//   3. Clamp expanded[0..31] → scalar (LE interpretation, RFC 8032)
+//   4. scalar_mult → projective point (Ed25519)
+//   5. Affine Y + sign bit → 32-byte public key
+//   6. Build SSH blob + Base64 encode (51 → 68 chars)
+//   7. Match pattern in variable part (base64[pos 25+])
+//   8. If matched: write seed to foundSeeds, pattern idx to results
+//   9. Increment seed by 1 (256-bit LE with carry) back to seeds buffer
+//
+// Output:
+//   results[i]     = pattern index (0-based) if matched, -1 otherwise
+//   foundSeeds[i]  = the seed bytes that produced the match (only valid if results[i]>=0)
 
 #include "./sha512.cl"
 #include "./big_math.cl"
@@ -22,19 +32,20 @@
 #include "./openssh.cl"
 
 __kernel void vanity_search(
-    __global const uchar* seeds,
+    __global uchar* seeds,           // READ_WRITE: 32-byte LE seeds, incremented each launch
     const int numSeeds,
     __global const uchar* patterns,
     __global const uchar* patternLens,
     __global const uchar* caseInsensFlags,
     const int numPatterns,
     __global int* results,
-    __global uchar* pubKeyOut
+    __global uchar* pubKeyOut,
+    __global uchar* foundSeeds        // write seed on match (only valid when results[idx]>=0)
 ) {
     int idx = (int)get_global_id(0);
     if (idx >= numSeeds) return;
 
-    // ── Load seed ──────────────────────────────────────────────────────
+    // ── Load seed (256-bit LE) ─────────────────────────────────────────
     uchar seed[32];
     for (int i = 0; i < 32; i++)
         seed[i] = seeds[idx * 32 + i];
@@ -89,12 +100,17 @@ __kernel void vanity_search(
     uint rX[8], rY[8], rZ[8];
     scalar_mult(scalar, rX, rY, rZ);
 
-    // ── 4. point_to_affine_y + sign bit → public key ───────────────────
-    uchar pubkey[32];
-    point_to_affine_y(rX, rY, rZ, pubkey);
-    uint rZi[8], rXi[8];
+    // ── 4. Affine Y + sign bit → public key ────────────────────────────
+    // Compute Z^(-1) mod p ONCE (used for both affine Y and sign bit).
+    // Avoids the double mod_p_inverse that point_to_affine_y + manual X
+    // would require (~85 mul_mod_p saved per seed).
+    uint rZi[8], rYa[8], rXi[8];
     mod_p_inverse(rZ, rZi);
-    mul_mod_p(rX, rZi, rXi);
+    mul_mod_p(rY, rZi, rYa);    // affine Y = rY / rZ mod p
+    mul_mod_p(rX, rZi, rXi);    // affine X = rX / rZ mod p (for sign bit)
+
+    uchar pubkey[32];
+    scalar_to_bytes(rYa, pubkey);
     if ((rXi[0] & 1u) != 0)
         pubkey[31] |= 0x80;
 
@@ -147,5 +163,23 @@ __kernel void vanity_search(
         }
     }
 
+    // ── 8. Write results ──────────────────────────────────────────────
     results[idx] = foundPat;
+    if (foundPat >= 0) {
+        // Write the MATCHING seed (BEFORE increment) so CPU can reproduce it
+        for (int i = 0; i < 32; i++)
+            foundSeeds[idx * 32 + i] = seed[i];
+    }
+
+    // ── 9. Increment seed by 1 (256-bit LE with carry) ────────────────
+    // Each work-item owns its seed and increments it independently.
+    // No synchronization needed — work-items don't share seed indices.
+    {
+        unsigned carry = 1;
+        for (int i = 0; i < 32; i++) {
+            unsigned s = (unsigned)seed[i] + carry;
+            seeds[idx * 32 + i] = (uchar)(s & 0xFF);
+            if (s < 256) { carry = 0; break; }
+        }
+    }
 }

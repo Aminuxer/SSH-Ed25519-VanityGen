@@ -25,20 +25,45 @@ or
 pip3 install python3-cryptography
 ```
 
+1). Для версии под GPU-OpenCL (видеокарты, FPGA) также установите python3-pyopencl и python3-numpy.
+```
+dnf install python3-opencl python3-numpy
+or
+apt install python3-opencl python3-numpy
+or
+pip3 install python3-opencl python3-numpy
+```
+
+
 #### Проверка версий
 ```
+# только CPU версия
 python3 -c "import sys; print('Python:', sys.version)"
 python3 -c "import cryptography; print('cryptography:', cryptography.__version__)"
+
+# GPU-версия
+python3 -c "import pyopencl; print('pyopencl:', pyopencl.__version__)"
+python3 -c "import numpy; print('numpy:', numpy.__version__)"
 ```
 
 #### PIP3-установка
 pip3 install "cryptography>=2.5"
 
+Для GPU также дополнительно:
+```
+pip3 install "pyopencl>=2026.1"
+pip3 install "numpy"
+```
 
 1). Запустите команду для генерации ключа:
-Пример с использование только CPU:
+Пример с использованием только CPU:
 ```
 python3 ssh_ed25519_vanity_multicpu.py User
+```
+
+Пример для видеокарты:
+```
+python3 ssh_ed25519_vanity_gpu_opencl.py User
 ```
 
 Пример вывода:
@@ -67,16 +92,23 @@ python3 ssh_ed25519_vanity_multicpu.py User
 ## Опции
 _-i_ : Нечувствительность к регистру. Сильно ускоряет поиск ключа, но регистр символов вряд ли совпадёт.
 
-_-w_ : Число потоков. По умолчанию = число ядер CPU.
+_-w_ : Число потоков/вычислителей. По умолчанию = число ядер CPU или число видеокарт.
 
-_-o_ : Выходной файл(ы) для найденных ключей.
+_-o_ : Выходной файл(ы) для найденных ключей. (префикс пути и имени)
 
 _--debug_ : Печатать HEX-зерно (секретные байты) для отладки.
 
 _--patterns-file_ : Файл со списком шаблонов, по одному на строку.
 
 
-Опции должны указывать после шаблона.
+Специфичные для GPU-версии:
+
+_--opencl-devices a,b,c_     Использовать только заданные OpenCL-устройства по их номеру (опция -w игнорируется)
+
+_--load-percent 1-100_       Какой % микроядер каждого GPU будет использован (по умолчанию: 100)
+
+
+Опции должны указываться после шаблона.
 
 Пример команды:
 ```
@@ -149,6 +181,7 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
 
 * Как быстро проверяются ключи ?
 
+##### CPU:
 | Оборудование | Ядер использовано (-w) | Ядер всего | ~ ключей в секунду |
 ---|---|---|---|
 | Celeron 633 [env-ed25519-translation] | 1 | 1 | 33 |

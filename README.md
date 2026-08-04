@@ -25,20 +25,50 @@ apt install python3-cryptography
 or 
 pip3 install python3-cryptography
 ```
+
+1). For GPU-OpenCL version install also python3-pyopencl and python3-numpy.
+```
+dnf install python3-opencl python3-numpy
+or
+apt install python3-opencl python3-numpy
+or 
+pip3 install python3-opencl python3-numpy
+```
+
+
 #### Check versions
 ```
+# CPU-only version
 python3 -c "import sys; print('Python:', sys.version)"
 python3 -c "import cryptography; print('cryptography:', cryptography.__version__)"
+
+# Also check for GPU version
+python3 -c "import pyopencl; print('pyopencl:', pyopencl.__version__)"
+python3 -c "import numpy; print('numpy:', numpy.__version__)"
 ```
 
 #### PIP-install
-pip3 install "cryptography>=2.5"
 
+```
+pip3 install "cryptography>=2.5"
+```
+
+
+For GPU:
+```
+pip3 install "pyopencl>=2026.1"
+pip3 install "numpy"
+```
 
 1). Run command for generate key:
 On CPU only:
 ```
 python3 ssh_ed25519_vanity_multicpu.py User
+```
+
+On GPU:
+```
+python3 ssh_ed25519_vanity_gpu_opencl.py User
 ```
 
 Example output
@@ -75,9 +105,16 @@ _--debug_ : Print HEX-seed private bytes for debug.
 
 _--patterns-file_ : Text file with patterns, one per string
 
+GPU-specific options:
 
-Options must be specified after pattern of pattern-file.
+_--opencl-devices a,b,c_     Use specific device IDs (ignores -w)
+
+_--load-percent 1-100_       % of GPU cores to use (default: 100)
+
+
+Options must be specified after pattern or pattern-file.
 Example command:
+
 ```
 python3 ssh_ed25519_vanity_multicpu.py User -w 6 -i -o user_key
 ```
@@ -147,6 +184,8 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
   - No. Too slow function.
 
 * How fast keys checked ?
+
+##### CPU:
 
 | Hardware | Cores used (-w) | Cores ALL | ~ keys per second |
 ---|---|---|---|

@@ -152,13 +152,15 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
 | Оборудование | Ядер использовано (-w) | Ядер всего | ~ ключей в секунду |
 ---|---|---|---|
 | AMD Turion II Neo N40 | 2 | 2 | 8 000 |
-| Raspberry Pi 4 Model B Rev 1.5  | 4 | 4 | 10 000 |
+| Raspberry Pi 4 Model B Rev 1.5 [ARM]  | 4 | 4 | 10 000 |
 | Core i5 CPU  650  @ 3.20GHz  | 4 | 4 | 22000 |
 | Celeron G9300 2.80 GH | 2 | 2 | 30 000 |
 | Xeon X3450 2.67GHz | 8 | 8 | 37 000 |
 | AMD Opteron(tm) Processor 2386 SE | 8 | 8 | 44 000 |
 | Core-i7 2700K  | 8 | 8 | 45 000 |
-| Core i7-6700HQ 2.60GHz  | 8  | 8 |  63000  |
+| Core i7-6700HQ 2.60GHz  | 8 | 8 |  63000  |
+| Core i7-7700K 4.50GHz  | 8 | 8 |  64000  |
+| Apple Silicon M4 CPU [ARM]  | 10 | 10 |  75000  |
 | Xeon CPU E5-2670 2.60GHz  | 20 | 32 | 140 000 |
 | 2x AMD EPYC 9334 3.90 GHz | 128 | 128 | 640 000 |
 

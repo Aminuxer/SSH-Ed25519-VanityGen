@@ -9,7 +9,10 @@ Additional defend against "fake-keys".
 
 ## Versions
 1). ssh_ed25519_vanity_multicpu.py - CPU-version.
-Python-3 multithreaded version. Load only CPU cores.
+Python-3 multiprocessing version. Load only CPU cores.
+
+2). ssh_ed25519_vanity_gpu_opencl.py - GPU-[OpenCL]-version.
+Python-3 multiprocessing + OpenCL (pyopencl) version. Load only OpenCL cores (GPU, FPGA ?).
 
 ## Installation and requirements
 

@@ -19,12 +19,16 @@ fi
 python3 -m pip --version
 
 python3 -m pip install --user "pyopencl>=2026.1"
+python3 -m pip install --user "cryptography>=3.1"
 python3 -m pip install --user "numpy"
 
 echo "Verification:"
 python3 << PYTHON
 import numpy
 import pyopencl
+import cryptography
+print("pyopencl: " + pyopencl.__version__)
+print("cryptography: " + cryptography.__version__)
 print("numpy: " + numpy.__version__)
 print("pyopencl: OK")
 PYTHON

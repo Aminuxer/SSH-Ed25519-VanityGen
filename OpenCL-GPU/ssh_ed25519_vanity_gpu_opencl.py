@@ -4,7 +4,7 @@
 Ed-25519 SSH Vanity Key Generator [OpenCL GPU]
 Port of ssh_ed25519_vanity_multicpu.py to GPU via OpenCL.
 ** Inspired by Aminuxer
-** Version: 2026-08-05--N-GPU
+** Version: 2026-08-06--N-GPU
 
 Usage:
     python3 ssh_ed25519_vanity_gpu_opencl.py <pattern> [-i] [-w <workers>] [-o output] [--debug]

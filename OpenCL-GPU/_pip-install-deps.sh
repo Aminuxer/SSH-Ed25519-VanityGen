@@ -2,7 +2,7 @@
 
 set -e
 
-echo "Preparing Python environment for SHA512 OpenCL tests..."
+echo "Preparing Python environment for OpenCL version ..."
 
 if [[ $EUID -eq 0 ]]; then
     echo "!! NO RUNNING from root;"
@@ -19,6 +19,7 @@ fi
 python3 -m pip --version
 
 python3 -m pip install --user "pyopencl>=2026.1"
+python3 -m pip install --user "numpy"
 
 echo "Verification:"
 python3 << PYTHON

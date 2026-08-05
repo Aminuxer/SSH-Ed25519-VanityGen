@@ -4,7 +4,7 @@
 Ed-25519 SSH Vanity Key Generator [OpenCL GPU]
 Port of ssh_ed25519_vanity_multicpu.py to GPU via OpenCL.
 ** Inspired by Aminuxer
-** Version: 2026-08-04--N-GPU
+** Version: 2026-08-05--N-GPU
 
 Usage:
     python3 ssh_ed25519_vanity_gpu_opencl.py <pattern> [-i] [-w <workers>] [-o output] [--debug]
@@ -29,8 +29,9 @@ from cryptography.hazmat.primitives import serialization
 B64_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
 
 
-# ─── Helpers ────────────────────────────────────────────────────────────
+# --- Helpers ------------------------------------------------------------
 
+"""Format seconds into human-readable duration string (dd:hh:mm:ss or shorter)."""
 def format_duration(seconds):
     """Format duration as days, hours, minutes, seconds."""
     if seconds < 0:
@@ -50,6 +51,7 @@ def format_duration(seconds):
     return " ".join(parts)
 
 
+"""Validate vanity pattern: length 2-30, base64 chars only."""
 def validate_pattern(pattern):
     """Check if pattern contains only valid Base64 characters."""
     if len(pattern) > 44:
@@ -57,11 +59,13 @@ def validate_pattern(pattern):
     return all(c in B64_CHARS for c in pattern)
 
 
+"""Sanitize pattern string for use in filename."""
 def sanitize_filename(name):
     """Replace invalid filename characters with underscores."""
     return re.sub(r'[^a-zA-Z0-9\-_.]', '_', name)
 
 
+"""Discover all available GPU OpenCL devices across platforms."""
 def get_all_gpu_devices():
     """Return list of (platform, device) tuples for all GPU devices."""
     devices = []
@@ -71,12 +75,13 @@ def get_all_gpu_devices():
     return devices
 
 
-# ─── GPU Worker ─────────────────────────────────────────────────────────
+# --- GPU Worker ---------------------------------------------------------
 
+"""Worker function for one GPU: compile kernel, run vanity search loop, report progress."""
 def worker_gpu(device_idx, patterns, case_insensitive,
                 result_queue, stop_event,
                 found_flags, kernel_path, load_percent):
-    """GPU worker process — runs OpenCL kernel in a loop.
+    """GPU worker process -- runs OpenCL kernel in a loop.
 
     SEED LIFECYCLE:
       - Random seeds generated ONCE at startup via os.urandom()
@@ -138,7 +143,7 @@ def worker_gpu(device_idx, patterns, case_insensitive,
         result_queue.put(('error', f"GPU init failed: {e}\n{traceback.format_exc()}"))
         return
 
-    # ── Allocate persistent GPU buffers ────────────────────────────────
+    # -- Allocate persistent GPU buffers --------------------------------
     mf = cl.mem_flags
     seeds_buf     = cl.Buffer(ctx, mf.READ_WRITE, batch_size * 32)
     results_buf   = cl.Buffer(ctx, mf.READ_WRITE, batch_size * 4)
@@ -148,7 +153,7 @@ def worker_gpu(device_idx, patterns, case_insensitive,
     pat_lens_buf  = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pat_lens_np)
     pat_ci_buf    = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pat_ci_np)
 
-    # ── Generate random seeds ONCE and upload ONCE ─────────────────────
+    # -- Generate random seeds ONCE and upload ONCE ---------------------
     seeds_np = np.frombuffer(os.urandom(batch_size * 32), dtype=np.uint8)
     cl.enqueue_copy(queue, seeds_buf, seeds_np, is_blocking=True)
 
@@ -162,7 +167,7 @@ def worker_gpu(device_idx, patterns, case_insensitive,
 
     try:
         while not stop_event.is_set():
-            # ── Launch kernel (seeds are incremented IN-PLACE on GPU) ──
+            # -- Launch kernel (seeds are incremented IN-PLACE on GPU) --
             kernel.set_args(
                 seeds_buf,
                 np.int32(batch_size),
@@ -175,13 +180,13 @@ def worker_gpu(device_idx, patterns, case_insensitive,
                                        (batch_size,),
                                        (local_size,))
 
-            # ── Download results (async D2H, then sync) ────────────────
+            # -- Download results (async D2H, then sync) ----------------
             cl.enqueue_copy(queue, results_np, results_buf)
             queue.finish()
 
             iterations += batch_size
 
-            # ── Check results for matches (vectorized) ─────────────────
+            # -- Check results for matches (vectorized) -----------------
             match_indices = np.where(results_np >= 0)[0]
             if len(match_indices) > 0:
                 # Download found seeds (only once per batch, not per match)
@@ -234,8 +239,9 @@ def worker_gpu(device_idx, patterns, case_insensitive,
     result_queue.put(('done', iterations))
 
 
-# ─── Main logic ─────────────────────────────────────────────────────────
+# --- Main logic ---------------------------------------------------------
 
+"""Main entry: launch GPU workers, collect matches, write SSH keys to disk."""
 def generate_vanity_key(patterns, case_insensitive=False,
                         num_workers=None, output_file=None,
                         debug_mode=False, opencl_devices=None,
@@ -453,8 +459,9 @@ def generate_vanity_key(patterns, case_insensitive=False,
         return None
 
 
-# ─── CLI ────────────────────────────────────────────────────────────────
+# --- CLI ----------------------------------------------------------------
 
+"""CLI entry point: parse args, validate patterns, call generate_vanity_key."""
 def main():
     if len(sys.argv) < 2 or '--help' in sys.argv or '-h' in sys.argv:
         print(__doc__.strip())
@@ -560,4 +567,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

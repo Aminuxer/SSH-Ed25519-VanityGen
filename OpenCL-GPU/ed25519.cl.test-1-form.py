@@ -16,16 +16,19 @@ D = 3709570593466943934313808350875456518954211387984321901638878553308594028355
 Bx = 15112221349535400772501151409588531511454012693041857206046113283949847762202
 By = 46316835694926478169428394003475163141307993866256225615783033603165251855960
 
+"""Convert integer to 4-element uint64 array (little-endian)."""
 def to_256bit(v):
     r = np.zeros(8, dtype=np.uint32)
     for i in range(8): r[i] = (v >> (32*i)) & 0xFFFFFFFF
     return r
 
+"""Convert 4-element uint64 array to integer (little-endian)."""
 def from_256bit(a):
     r = 0
     for i in range(8): r += int(a[i]) << (32*i)
     return r
 
+"""Convert projective point (x,y,z) to 96-byte LE representation."""
 def pt_to_bytes(pt):
     out = bytearray(96)
     for ci, coord in enumerate([pt[0], pt[1], pt[2]]):
@@ -36,6 +39,7 @@ def pt_to_bytes(pt):
                 out[base + i*4 + j] = (v >> (8*j)) & 0xFF
     return bytes(out)
 
+"""Parse 96-byte LE data back to projective point (x,y,z)."""
 def pt_from_bytes(b):
     coords = []
     for base in [0, 32, 64]:
@@ -46,6 +50,7 @@ def pt_from_bytes(b):
         coords.append(np.array(limb, dtype=np.uint32))
     return tuple(coords)
 
+"""Convert projective point (X,Y,Z) to affine (x,y) using Z^(-1) mod p."""
 def proj2aff(pt):
     X = from_256bit(pt[0]); Y = from_256bit(pt[1]); Z = from_256bit(pt[2])
     if Z == 0: return 0, 0  # crash-safe fallback
@@ -55,14 +60,16 @@ def proj2aff(pt):
 def le32(v): return v.to_bytes(32, byteorder='little')
 def le32i(b): return int.from_bytes(b, byteorder='little')
 
+"""Check if affine point (x,y) lies on the Ed25519 curve: -x^2 + y^2 = 1 + d*x^2*y^2."""
 def on_curve(x, y):
     x2 = (x*x)%P; y2 = (y*y)%P
     return (y2 - x2)%P == (1 + D*x2*y2)%P
 
-# ─── Reference: affine formulas for a=-1 (Ed25519) ──────
+# --- Reference: affine formulas for a=-1 (Ed25519) ------
 # x3 = (x1*y2 + x2*y1) / (1 + d*x1*y1*x2*y2)
 # y3 = (y1*y2 + x1*x2) / (1 - d*x1*y1*x2*y2)
 
+"""CPU reference: add two affine points on Ed25519."""
 def pt_aff_add(x1,y1,x2,y2):
     den_x = (1 + D*x1*y1*x2*y2) % P
     den_y = (1 - D*x1*y1*x2*y2) % P
@@ -70,6 +77,7 @@ def pt_aff_add(x1,y1,x2,y2):
     y3 = ((y1*y2 + x1*x2) % P * pow(den_y, P-2, P)) % P
     return x3, y3
 
+"""CPU reference: scalar multiplication on Ed25519 (double-and-add)."""
 def scalar_mult_ref(scalar_bytes):
     """Double-and-add, bits 255..0, affine coords.
     Matches the algorithm in ed25519.cl."""
@@ -82,6 +90,7 @@ def scalar_mult_ref(scalar_bytes):
             rx, ry = pt_aff_add(rx, ry, Bx, By)  # add base
     return rx, ry
 
+"""CPU reference: projective point addition on Ed25519."""
 def proj_add_ref(x1,y1,z1,x2,y2,z2):
     """Projective addition via affine conversion."""
     if z1 == 0: ax1, ay1 = 0, 1
@@ -95,14 +104,16 @@ def proj_add_ref(x1,y1,z1,x2,y2,z2):
     x3 = (ax3*z3) % P; y3 = (ay3*z3) % P
     return x3, y3, z3
 
-# ─── GPU runners ─────────────────────────────────────────
+# --- GPU runners -----------------------------------------
 
+"""Find and return the first GPU OpenCL device."""
 def get_device():
     for p in cl.get_platforms():
         for d in p.get_devices():
             if d.type == cl.device_type.GPU: return d
     raise RuntimeError("No GPU")
 
+"""Run GPU point_add_projective kernel with two projective points."""
 def run_add(kc, p1, p2):
     dev = get_device(); ctx = cl.Context([dev]); queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kc).build()
@@ -115,6 +126,7 @@ def run_add(kc, p1, p2):
     r = np.empty(96, dtype=np.uint8)
     cl.enqueue_copy(queue, r, bo, is_blocking=True); return r
 
+"""Run GPU scalar_mult kernel with 32-byte LE scalar."""
 def run_scalar(kc, scal):
     dev = get_device(); ctx = cl.Context([dev]); queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kc).build()
@@ -126,6 +138,7 @@ def run_scalar(kc, scal):
     r = np.empty(96, dtype=np.uint8)
     cl.enqueue_copy(queue, r, bo, is_blocking=True); return r
 
+"""Run GPU point_init_base kernel to initialize base point B."""
 def run_init(kc):
     dev = get_device(); ctx = cl.Context([dev]); queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kc).build()
@@ -137,6 +150,7 @@ def run_init(kc):
     r = np.empty(96, dtype=np.uint8)
     cl.enqueue_copy(queue, r, bo, is_blocking=True); return r
 
+"""Run GPU point_to_affine_x kernel with 96-byte projective point."""
 def run_aff_x(kc, ptb):
     dev = get_device(); ctx = cl.Context([dev]); queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kc).build()
@@ -148,6 +162,7 @@ def run_aff_x(kc, ptb):
     r = np.empty(32, dtype=np.uint8)
     cl.enqueue_copy(queue, r, bo, is_blocking=True); return r
 
+"""Run GPU point_to_affine_y kernel with 96-byte projective point."""
 def run_aff_y(kc, ptb):
     dev = get_device(); ctx = cl.Context([dev]); queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kc).build()
@@ -159,8 +174,9 @@ def run_aff_y(kc, ptb):
     r = np.empty(32, dtype=np.uint8)
     cl.enqueue_copy(queue, r, bo, is_blocking=True); return r
 
-# ─── Tests ───────────────────────────────────────────────
+# --- Tests -----------------------------------------------
 
+"""Test GPU point_init_base against known base point B."""
 def test_init(kc):
     print("Testing point_init_base...")
     ok = True
@@ -172,6 +188,7 @@ def test_init(kc):
         print("  FAIL: expected (%d,%d) got (%d,%d)" % (Bx, By, x, y)); ok = False
     return ok
 
+"""Test GPU point_add_projective against CPU reference for random points."""
 def test_add(kc):
     print("Testing point_add_projective...")
     ok = True
@@ -204,6 +221,7 @@ def test_add(kc):
                 ok = False
     return ok
 
+"""Test GPU scalar_mult against CPU reference for random scalars."""
 def test_scalar(kc):
     print("Testing scalar_mult (raw)...")
     ok = True
@@ -227,6 +245,7 @@ def test_scalar(kc):
             ok = False
     return ok
 
+"""Test GPU point_to_affine_x/y against CPU reference for random projective points."""
 def test_affine(kc):
     print("Testing point_to_affine_x/y...")
     ok = True
@@ -249,7 +268,7 @@ def test_affine(kc):
     else: print("  FAIL: aff_y Z=7: exp=%d got=%d" % (sy, gy2)); ok = False
     return ok
 
-# ─── Custom mode (--x --y --z) ───────────────────────────
+# --- Custom mode (--x --y --z) ---------------------------
 
 def parse_int(h, d=0):
     if h is None: return d
@@ -257,6 +276,7 @@ def parse_int(h, d=0):
         return int(h, 16)
     return int(h, 10)
 
+"""Test GPU point_to_affine_x/y with custom projective coordinates."""
 def custom_test(kc, xi, yi, zi):
     print("Custom test: X=%d (hex: 0x%x) Y=%d (hex: 0x%x) Z=%d (hex: 0x%x)" % (xi, xi, yi, yi, zi, zi))
     pt = pt_to_bytes((to_256bit(xi), to_256bit(yi), to_256bit(zi)))
@@ -279,8 +299,9 @@ def custom_test(kc, xi, yi, zi):
     srx, sry = scalar_mult_ref(sb)
     print("  scalar(x): ref=(%d,%d) gpu=(%d,%d) %s" % (srx, sry, gsx, gsy, "OK" if gsx==srx and gsy==sry else "DIFF"))
 
-# ─── Main ────────────────────────────────────────────────
+# --- Main ------------------------------------------------
 
+"""Entry point: parse args, run selected tests, report results."""
 def main():
     pa = argparse.ArgumentParser()
     pa.add_argument("--func", choices=["all","add","scalar","init","affine"], default="all")

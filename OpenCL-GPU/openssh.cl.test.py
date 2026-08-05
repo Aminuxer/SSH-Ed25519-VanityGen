@@ -35,14 +35,16 @@ try:
 except ImportError:
     CRYPTO_AVAILABLE = False
 
-# ─── Reference: Base64 encoding ─────────────────────────
+# --- Reference: Base64 encoding -------------------------
 
+"""CPU reference: base64 encode bytes using Python standard library."""
 def ref_base64_encode(data: bytes) -> bytes:
     """Reference Base64 encoding via Python stdlib."""
     return base64.b64encode(data)
 
-# ─── Reference: SSH public key blob ─────────────────────
+# --- Reference: SSH public key blob ---------------------
 
+"""CPU reference: build SSH public key binary blob (51 bytes)."""
 def ref_ssh_public_blob(pub_key: bytes) -> bytes:
     """Build SSH public key binary blob: uint32_BE(11) || "ssh-ed25519" || uint32_BE(32) || pubkey(32)"""
     type_str = b"ssh-ed25519"
@@ -50,6 +52,7 @@ def ref_ssh_public_blob(pub_key: bytes) -> bytes:
     blob += struct.pack(">I", len(pub_key)) + pub_key
     return blob
 
+"""CPU reference: build full "ssh-ed25519 <b64> <comment>" line."""
 def ref_ssh_public_line(pub_key: bytes, comment: bytes = b"") -> bytes:
     """Build full SSH public key line: 'ssh-ed25519 <base64> <comment>'"""
     blob = ref_ssh_public_blob(pub_key)
@@ -59,8 +62,9 @@ def ref_ssh_public_line(pub_key: bytes, comment: bytes = b"") -> bytes:
         line += b" " + comment
     return line
 
-# ─── GPU runners ─────────────────────────────────────────
+# --- GPU runners -----------------------------------------
 
+"""Find and return the first GPU OpenCL device."""
 def get_device():
     for p in cl.get_platforms():
         for d in p.get_devices():
@@ -68,6 +72,7 @@ def get_device():
                 return d
     raise RuntimeError("No GPU")
 
+"""Run GPU base64_encode kernel and return decoded string."""
 def run_base64(kc, data: bytes):
     """Run base64_encode kernel."""
     dev = get_device()
@@ -87,6 +92,7 @@ def run_base64(kc, data: bytes):
     cl.enqueue_copy(queue, r, bo, is_blocking=True)
     return bytes(r)
 
+"""Run GPU build_ssh_public_blob kernel."""
 def run_build_blob(kc, pub_key: bytes):
     """Run build_ssh_public_blob kernel (wrapper from openssh_test_kernels.cl)."""
     dev = get_device()
@@ -103,8 +109,9 @@ def run_build_blob(kc, pub_key: bytes):
     cl.enqueue_copy(queue, r, bo, is_blocking=True)
     return bytes(r)
 
+"""Run GPU seed_to_ssh_ed25519_pubkey kernel (full pipeline)."""
 def run_openkey(kc, seed: bytes, comment: bytes = b""):
-    """Run seed_to_ssh_ed25519_pubkey kernel — returns (pubKey, pubLine)."""
+    """Run seed_to_ssh_ed25519_pubkey kernel -- returns (pubKey, pubLine)."""
     dev = get_device()
     ctx = cl.Context([dev])
     queue = cl.CommandQueue(ctx)
@@ -126,8 +133,9 @@ def run_openkey(kc, seed: bytes, comment: bytes = b""):
     cl.enqueue_copy(queue, pub_line, bo_publine, is_blocking=True)
     return bytes(pub_key), bytes(pub_line)
 
-# ─── Pipeline debug functions ────────────────────────────────
+# --- Pipeline debug functions --------------------------------
 
+"""Run GPU SHA512 on 32-byte seed, return 64-byte hash."""
 def run_sha512_32(kc, seed: bytes) -> bytes:
     """Run SHA512-32 kernel."""
     dev = get_device()
@@ -144,6 +152,7 @@ def run_sha512_32(kc, seed: bytes) -> bytes:
     cl.enqueue_copy(queue, r, bo, is_blocking=True)
     return bytes(r)
 
+"""Run GPU scalar_mult and return 96-byte projective point."""
 def run_scalar_mult(kc, scalar: bytes) -> bytes:
     """Run scalar_mult wrapper: 32-byte LE scalar -> 96-byte projective point."""
     dev = get_device()
@@ -160,6 +169,7 @@ def run_scalar_mult(kc, scalar: bytes) -> bytes:
     cl.enqueue_copy(queue, r, bo, is_blocking=True)
     return bytes(r)
 
+"""Run GPU point_to_affine_y and return 32-byte LE affine Y."""
 def run_point_to_affine_y(kc, point: bytes) -> bytes:
     """Run point_to_affine_y wrapper: 96-byte projective -> 32-byte LE Y."""
     dev = get_device()
@@ -176,6 +186,7 @@ def run_point_to_affine_y(kc, point: bytes) -> bytes:
     cl.enqueue_copy(queue, r, bo, is_blocking=True)
     return bytes(r)
 
+"""Run GPU clamp_and_encode: scalar -> public key (32 bytes)."""
 def run_clamp_and_encode(kc, scalar_in: bytes) -> bytes:
     """Run clamp+encode: 32-byte LE scalar -> 32-byte pubkey."""
     dev = get_device()
@@ -192,8 +203,9 @@ def run_clamp_and_encode(kc, scalar_in: bytes) -> bytes:
     cl.enqueue_copy(queue, r, bo, is_blocking=True)
     return bytes(r)
 
-# ─── Reference helpers for pipeline ─────────────────────────
+# --- Reference helpers for pipeline -------------------------
 
+"""CPU reference: clamp 32-byte hash to Ed25519 scalar."""
 def ref_clamp_scalar(hash_bytes: bytes) -> bytes:
     """Clamp first 32 bytes of SHA512 output to LE scalar (NaCl/cryptography)."""
     expanded = hash_bytes[:32]
@@ -203,6 +215,7 @@ def ref_clamp_scalar(hash_bytes: bytes) -> bytes:
     scalar[31] |= 0x40   # set top-1 bit of MSB
     return bytes(scalar)
 
+"""CPU reference: scalar multiplication on Ed25519, returns (x, y)."""
 def ref_scalar_mult(scalar: bytes) -> tuple:
     """Compute scalar * B using Python (slower but correct)."""
     k = int.from_bytes(scalar, byteorder="little")
@@ -235,12 +248,14 @@ def ref_scalar_mult(scalar: bytes) -> tuple:
             rx, ry = add(rx, ry, Bx, By)  # add base
     return rx, ry
 
+"""CPU reference: build 32-byte public key from affine Y and X sign bit."""
 def ref_point_to_pub(affine_y: bytes, x_sign: int) -> bytes:
     """Encode 32-byte LE Y + X sign bit as public key."""
     pub = bytearray(affine_y)
     pub[31] |= (x_sign << 7)
     return bytes(pub)
 
+"""CPU reference: check if point is on Ed25519 curve."""
 def ref_point_on_curve(x, y) -> bool:
     """Check if (x,y) is on Ed25519 curve."""
     P = 2**255 - 19
@@ -249,8 +264,9 @@ def ref_point_on_curve(x, y) -> bool:
     rhs = (1 + D*x*x*y*y) % P
     return lhs == rhs
 
-# ─── Standard test suites ────────────────────────────────
+# --- Standard test suites --------------------------------
 
+"""Test GPU base64_encode against Python reference for random data."""
 def test_base64(kc):
     """Standard base64 test suite."""
     print("Testing base64_encode...")
@@ -279,6 +295,7 @@ def test_base64(kc):
             ok = False
     return ok
 
+"""Test GPU build_ssh_public_blob against CPU reference."""
 def test_build_blob(kc):
     """Standard build_ssh_public_blob test suite."""
     print("Testing build_ssh_public_blob...")
@@ -300,8 +317,9 @@ def test_build_blob(kc):
             ok = False
     return ok
 
+"""Test GPU seed_to_ssh_ed25519_pubkey against CPU cryptography reference."""
 def test_openkey(kc):
-    """Open key test suite — GPU seed→pubkey vs cryptography.hazmat reference.
+    """Open key test suite -- GPU seed->pubkey vs cryptography.hazmat reference.
 
     seeds_comments: test seeds with their expected comments.
     Reference: seed-2-openssh-key.py on the server produces the same public key.
@@ -342,8 +360,9 @@ def test_openkey(kc):
             print("  SKIP seed %s: cryptography not available" % seed.hex()[:8])
     return ok
 
+"""Test full pipeline: SHA512 -> clamp -> scalar_mult -> affine -> pubkey."""
 def test_pipeline(kc):
-    """Detailed step-by-step pipeline debug for seed→pubkey.
+    """Detailed step-by-step pipeline debug for seed->pubkey.
 
     Tests each stage of the Ed25519 key generation pipeline:
     1. SHA512(seed)
@@ -358,7 +377,7 @@ def test_pipeline(kc):
     ok = True
     seed = bytes.fromhex("5a72ad0ce00b6619c22cf504ffd6984811b8805759a4bc6701351d728ff5898d")
 
-    # ─── Step 1: SHA512 ───
+    # --- Step 1: SHA512 ---
     print("\n[Step 1] SHA512(seed)")
     ref_hash = hashlib.sha512(seed).digest()
     gpu_hash = run_sha512_32(kc, seed)
@@ -370,7 +389,7 @@ def test_pipeline(kc):
         print("    GPU: %s" % gpu_hash.hex())
         ok = False
 
-    # ─── Step 2: Scalar clamping ───
+    # --- Step 2: Scalar clamping ---
     print("\n[Step 2] Scalar clamping (RFC 8032)")
     ref_scalar = ref_clamp_scalar(ref_hash)
     # GPU clamping is in clamp_and_encode, so we test it indirectly
@@ -378,7 +397,7 @@ def test_pipeline(kc):
     print("  expanded[0]=0x%02x -> clamped 0x%02x (0xF8 mask)" % (ref_hash[0], ref_hash[0] & 0xF8))
     print("  expanded[31]=0x%02x -> clamped 0x%02x (0x7F|0x40)" % (ref_hash[31], (ref_hash[31] & 0x7F) | 0x40))
 
-    # ─── Step 3: Scalar multiplication ───
+    # --- Step 3: Scalar multiplication ---
     print("\n[Step 3] Scalar multiplication")
     gpu_point = run_scalar_mult(kc, ref_scalar)
     gpu_X = int.from_bytes(gpu_point[0:32], "little")
@@ -406,7 +425,7 @@ def test_pipeline(kc):
         print("  GPU point is on Ed25519 curve: NO!")
         ok = False
 
-    # ─── Compare GPU scalar_mult with cryptography reference ───
+    # --- Compare GPU scalar_mult with cryptography reference ---
     print("\n[Compare] GPU scalar_mult vs cryptography reference")
     # Test with small scalar k=2
     scalar_2 = bytes([2] + [0]*31)
@@ -460,7 +479,7 @@ def test_pipeline(kc):
             print("    Y diff: %s" % hex(affine_Y ^ ref_Y)[:40])
             ok = False
 
-    # ─── Step 4: Point to affine Y ───
+    # --- Step 4: Point to affine Y ---
     print("\n[Step 4] Point to affine Y conversion")
     gpu_Y_affine = run_point_to_affine_y(kc, gpu_point)
     print("  GPU affine Y: %s" % gpu_Y_affine.hex())
@@ -472,7 +491,7 @@ def test_pipeline(kc):
         print("    Ref: %s" % ref_Y_bytes.hex())
         ok = False
 
-    # ─── Step 5: Public key encoding ───
+    # --- Step 5: Public key encoding ---
     print("\n[Step 5] Public key encoding (Y + X sign bit)")
     gpu_pub = run_clamp_and_encode(kc, ref_scalar)
     print("  GPU pubkey: %s" % gpu_pub.hex())
@@ -492,13 +511,14 @@ def test_pipeline(kc):
 
     return ok
 
+"""Test debug_pipeline kernel with intermediate value outputs."""
 def test_debug(kc):
     """Debug: compare intermediate values between seed_to_ssh_ed25519_pubkey and step-by-step."""
     print("Testing debug pipeline (intermediate values)...")
     ok = True
     seed = bytes.fromhex("5a72ad0ce00b6619c22cf504ffd6984811b8805759a4bc6701351d728ff5898d")
 
-    # ─── Step 1: SHA512 ───
+    # --- Step 1: SHA512 ---
     print("\n[Step 1] SHA512")
     ref_hash = hashlib.sha512(seed).digest()
     gpu_hash = run_sha512_32(kc, seed)
@@ -510,12 +530,12 @@ def test_debug(kc):
         print("  FAIL: SHA512 mismatch!")
         ok = False
 
-    # ─── Step 2: Scalar derivation ───
+    # --- Step 2: Scalar derivation ---
     print("\n[Step 2] Scalar derivation")
     ref_scalar = ref_clamp_scalar(ref_hash)
     print("  Ref scalar: %s" % ref_scalar.hex())
 
-    # ─── Step 3: debug_pipeline kernel ───
+    # --- Step 3: debug_pipeline kernel ---
     print("\n[Step 3] debug_pipeline (full GPU path)")
     dev = get_device()
     ctx = cl.Context([dev])
@@ -543,7 +563,7 @@ def test_debug(kc):
     print("  GPU scalar: %s" % d_scalar.hex())
     print("  GPU pubkey: %s" % d_pub.hex())
 
-    # ─── Step 4: Run seed_to_ssh_ed25519_pubkey ───
+    # --- Step 4: Run seed_to_ssh_ed25519_pubkey ---
     print("\n[Step 4] seed_to_ssh_ed25519_pubkey (original kernel)")
     gpu_pubkey, gpu_line = run_openkey(kc, seed, b"")
     print("  GPU pubkey: %s" % gpu_pubkey.hex())
@@ -582,7 +602,7 @@ def test_debug(kc):
             print("    ref: %s" % pub_key.hex())
             ok = False
 
-    # ─── Compare scalar_mult with Python reference ───
+    # --- Compare scalar_mult with Python reference ---
     print("\n[Compare scalar_mult]")
     gpu_point = run_scalar_mult(kc, ref_scalar)
     gpu_X = int.from_bytes(gpu_point[0:32], "little")
@@ -617,8 +637,9 @@ def test_debug(kc):
 
     return ok
 
-# ─── Custom tests (--data / --hex-data) ──────────────────
+# --- Custom tests (--data / --hex-data) ------------------
 
+"""Run custom base64 test with user-supplied data."""
 def custom_base64(kc, data: bytes):
     """Custom base64 test with arbitrary data."""
     ref_b64 = ref_base64_encode(data)
@@ -634,6 +655,7 @@ def custom_base64(kc, data: bytes):
     print()
     return match == "OK"
 
+"""Run custom openkey test with user-supplied seed."""
 def custom_openkey(kc, data: bytes):
     """Custom openkey test. data = 32-byte seed.
 
@@ -650,7 +672,7 @@ def custom_openkey(kc, data: bytes):
 
     ok = True
     if not CRYPTO_AVAILABLE:
-        print("WARN: cryptography not available — GPU only mode")
+        print("WARN: cryptography not available -- GPU only mode")
         gpu_pubkey, gpu_line = run_openkey(kc, seed, comment)
         null_pos = gpu_line.find(b'\x00')
         if null_pos > 0:
@@ -680,7 +702,7 @@ def custom_openkey(kc, data: bytes):
     if m == "DIFF": ok = False
     print()
 
-    print("BASE64 (SSH public blob — generated INSIDE GPU kernel)")
+    print("BASE64 (SSH public blob -- generated INSIDE GPU kernel)")
     print("  REF: %s" % ref_b64.decode())
     gpu_b64_raw = gpu_line[len(b"ssh-ed25519 "):]
     if comment:
@@ -702,6 +724,7 @@ def custom_openkey(kc, data: bytes):
     print()
     return ok
 
+"""Run custom blob test with user-supplied pubkey."""
 def custom_blob(kc, data: bytes):
     """Custom blob test. data = 32-byte raw pubkey."""
     if len(data) != 32:
@@ -718,8 +741,9 @@ def custom_blob(kc, data: bytes):
     print()
     return match == "OK"
 
-# ─── Main ────────────────────────────────────────────────
+# --- Main ------------------------------------------------
 
+"""Parse user input: hex string or file path to bytes."""
 def resolve_data(text):
     """Resolve --data input:
     - 64 hex chars (no 0x) -> seed bytes (32 bytes)
@@ -739,6 +763,7 @@ def resolve_data(text):
     # UTF-8 text
     return text.encode('utf-8')
 
+"""Entry point: parse args, run selected tests, report results."""
 def main():
     pa = argparse.ArgumentParser(
         description="OpenSSH Ed25519 Public Key OpenCL Test Suite",
@@ -764,7 +789,7 @@ Examples:
     dev = get_device()
     print("Device: %s" % dev.name)
     if not CRYPTO_AVAILABLE:
-        print("WARN: cryptography not installed — limited tests")
+        print("WARN: cryptography not installed -- limited tests")
 
     kc = open("./openssh_test_kernels.cl").read()
     print("Kernel: ./openssh_test_kernels.cl\n")

@@ -1,10 +1,10 @@
-// OpenSSH Ed25519 public key generation — OpenCL kernel
+// OpenSSH Ed25519 public key generation - OpenCL kernel
 // TIMESTAMP 1785623229
 //
 // Dependencies (provided by test kernel wrapper via #include):
-//   sha512.cl  → sha512_transform, SHA512_H, little_s0, little_s1
-//   big_math.cl → scalar_to_bytes, seed_to_scalar, add_256, etc.
-//   ed25519.cl  → scalar_mult, point_to_affine_y, point_init_base, D, BASE_X/Y
+//   sha512.cl  -> sha512_transform, SHA512_H, little_s0, little_s1
+//   big_math.cl -> scalar_to_bytes, seed_to_scalar, add_256, etc.
+//   ed25519.cl  -> scalar_mult, point_to_affine_y, point_init_base, D, BASE_X/Y
 //
 // THIS FILE MUST NOT #include other .cl files.
 // The test wrapper (openssh_test_kernels.cl) includes dependencies with
@@ -14,15 +14,15 @@
 //   seed_to_ssh_ed25519_pubkey is a single __kernel that:
 //     1. Computes SHA512(seed) inline (sha512_transform from sha512.cl)
 //     2. Clamps first 32 bytes ?
-//     3. scalar_mult → projective point (ed25519.cl)
-//     4. point_to_affine_y → 32-byte public key
-//     5. build SSH public blob + base64 → public key line
+//     3. scalar_mult -> projective point (ed25519.cl)
+//     4. point_to_affine_y -> 32-byte public key
+//     5. build SSH public blob + base64 -> public key line
 //
 // Output format (OpenSSH public key line):
 //   "ssh-ed25519 <base64-blob> <comment>"
 //   where base64-blob = base64( uint32(11) || "ssh-ed25519" || uint32(32) || pubkey(32) )
 
-// ─── Base64 ─────────────────────────────────────────────
+// --- Base64 ---------------------------------------------
 
 __constant uchar BASE64_TABLE[64] = {
     'A','B','C','D','E','F','G','H','I','J','K','L','M',
@@ -87,11 +87,10 @@ __kernel void base64_encode(
     output[outPos] = 0;
 }
 
-// ─── Inline helpers ─────────────────────────────────────
+// --- Inline helpers -------------------------------------
 
-// Build SSH public key binary blob (SSH wire format = BIG-ENDIAN):
-//   uint32_BE(11) || "ssh-ed25519" || uint32_BE(32) || pubKey(32)
-// Total: 51 bytes
+/* Build SSH public key binary blob (SSH wire format = BIG-ENDIAN):
+   uint32_BE(11) || "ssh-ed25519" || uint32_BE(32) || pubKey(32). Total: 51 bytes. */
 __inline void build_ssh_public_blob(__generic const uchar* pubKey, __generic uchar* blob) {
     // uint32_BE(11) = type string length
     blob[0] = 0x00; blob[1] = 0x00; blob[2] = 0x00; blob[3] = 0x0B;
@@ -108,11 +107,11 @@ __inline void build_ssh_public_blob(__generic const uchar* pubKey, __generic uch
     }
 }
 
-// ─── Main pubkey kernel ─────────────────────────────────
+// --- Main pubkey kernel ---------------------------------
 
-// Kernel: seed_to_ssh_ed25519_pubkey
-// Input:  seed (32 bytes), commentBuf [4 bytes LE len + comment bytes]
-// Output: publicKey (32 bytes), pubLine (max 256 bytes)
+/* Full pipeline: seed -> SHA512 -> clamp -> scalar_mult -> affine Y -> SSH public key line.
+   Precomputes Z^(2^k) squaring chain T for fast modular inverse.
+   Outputs: 32-byte publicKey and full "ssh-ed25519 <b64> <comment>" line. */
 __kernel void seed_to_ssh_ed25519_pubkey(
     __global const uchar* seed,           // 32-byte seed (LE)
     __global const uchar* commentBuf,     // [4 bytes LE length][comment bytes (max 64)]
@@ -120,7 +119,7 @@ __kernel void seed_to_ssh_ed25519_pubkey(
     __global uchar* pubLine               // 256 bytes output: "ssh-ed25519 <b64> <comment>\0"
 ) {
     // ======================================================================
-    // 1. SHA512(seed) → expanded[64]
+    // 1. SHA512(seed) -> expanded[64]
     //    seed = 32 bytes = single SHA512 block (needs padding to 128 bytes)
     // ======================================================================
     unsigned long state[8];
@@ -165,7 +164,7 @@ __kernel void seed_to_ssh_ed25519_pubkey(
     }
 
     // ======================================================================
-    // 2. Scalar derivation: SHA512 output → clamped scalar (LE interpretation)
+    // 2. Scalar derivation: SHA512 output -> clamped scalar (LE interpretation)
     //
     //    expanded[0..31] = SHA512 output bytes.
     //    cryptography.hazmat interprets this as LITTLE-ENDIAN integer:
@@ -184,20 +183,29 @@ __kernel void seed_to_ssh_ed25519_pubkey(
     scalar_bytes[31] |= 0x40;   // MSB: set top-1 bit
 
     // ======================================================================
-    // 3. scalar_mult → projective point (X, Y, Z)
+    // 3. scalar_mult -> projective point (X, Y, Z)
     // ======================================================================
-    uint rX[8], rY[8], rZ[8];
+    ulong rX[4], rY[8], rZ[8];
     scalar_mult(scalar_bytes, rX, rY, rZ);
 
     // ======================================================================
-    // 4. point_to_affine_y → publicKey (32 bytes LE)
+    // 4. Precompute Z^(2^k) table for Montgomery inverse
+    // ======================================================================
+    ulong T[1020];
+    mod_p_reduce(rZ);
+    copy_256(rZ, T);
+    for (int k = 1; k < 255; k++)
+        mul_mod_p(T+(k-1)*4, T+(k-1)*4, T+k*4);
+
+    // ======================================================================
+    // 5. point_to_affine_y -> publicKey (32 bytes LE)
     //    Set high bit of publicKey[31] based on sign of affine X (bit 0)
     // ======================================================================
     uchar pubkey_affine[32];
-    point_to_affine_y(rX, rY, rZ, pubkey_affine);
+    point_to_affine_y(T, rX, rY, rZ, pubkey_affine);
     // Compute affine X = rX / rZ mod p for sign bit
-    uint rZi[8], rXi[8];
-    mod_p_inverse(rZ, rZi);
+    ulong rZi[4], rXi[8];
+    mod_p_inverse(T, rZi);
     mul_mod_p(rX, rZi, rXi);
     // Set sign bit (bit 7 of last byte) based on parity of affine X
     if ((rXi[0] & 1u) != 0) {
@@ -216,7 +224,7 @@ __kernel void seed_to_ssh_ed25519_pubkey(
     uchar ssh_blob[51];
     build_ssh_public_blob(pubkey_affine, ssh_blob);
 
-    // 5b. Base64 encode (inline — can't call another __kernel)
+    // 5b. Base64 encode (inline - can't call another __kernel)
     uchar b64buf[88];
     int b64len = 0;
     {

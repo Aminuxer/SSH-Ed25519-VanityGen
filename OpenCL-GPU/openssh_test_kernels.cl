@@ -30,14 +30,14 @@
 // Rename openssh inline helpers (NOT kernels: base64_encode and seed_to_ssh_ed25519_pubkey are __kernel)
 #define build_ssh_public_blob kl_build_ssh_public_blob
 
-// ─── Include dependencies BEFORE openssh.cl ─────────────────
+// --- Include dependencies BEFORE openssh.cl -----------------
 // sha512.cl must come first (SHA512_H, sha512_transform, little_s0/s1)
 #include "./sha512.cl"
 // big_math.cl: add_256, mul_mod_p, scalar_to_bytes, etc.
 #include "./big_math.cl"
 // ed25519.cl: scalar_mult, point_to_affine_y, etc.
 #include "./ed25519.cl"
-// openssh.cl: no includes — uses everything from above
+// openssh.cl: no includes - uses everything from above
 #include "./openssh.cl"
 
 #undef add_256
@@ -56,7 +56,7 @@
 #undef point_to_affine_y
 #undef scalar_mult
 #undef build_ssh_public_blob
-// NOTE: base64_encode and seed_to_ssh_ed25519_pubkey are __kernel in openssh.cl — not renamed, not undef'd
+// NOTE: base64_encode and seed_to_ssh_ed25519_pubkey are __kernel in openssh.cl - not renamed, not undef'd
 
 // =====================================================================
 // Additional kernel wrappers for inline helpers from openssh.cl
@@ -125,12 +125,19 @@ __kernel void clamp_and_encode(
     __global uchar* pub_out           // 32 bytes (public key)
 ) {
     // Scalar multiplication
-    uint rX[8], rY[8], rZ[8];
+    ulong rX[4], rY[4], rZ[4];
     kl_scalar_mult(scalar_in, rX, rY, rZ);
 
-    // Convert to affine Y
+    // Convert to affine Y (precompute T table from rZ)
     uchar y_affine[32];
-    kl_point_to_affine_y(rX, rY, rZ, y_affine);
+    {
+        ulong T[1020];
+        kl_copy_256(rZ, T);
+        kl_mod_p_reduce(T);
+        for (int k = 1; k < 255; k++)
+            kl_mul_mod_p(T+(k-1)*4, T+(k-1)*4, T+k*4);
+        kl_point_to_affine_y(T, rX, rY, rZ, y_affine);
+    }
 
     // Set sign bit based on X parity
     if ((rX[0] & 1u) != 0) {
@@ -148,30 +155,12 @@ __kernel void scalar_mult_wrapper(
     __global const uchar* scalar_in,  // 32 bytes LE scalar
     __global uchar* point_out         // 96 bytes (X:Y:Z projective)
 ) {
-    uint rX[8], rY[8], rZ[8];
+    ulong rX[4], rY[4], rZ[4];
     kl_scalar_mult(scalar_in, rX, rY, rZ);
 
-    // Write X (32 bytes LE)
-    for (int i = 0; i < 8; i++) {
-        point_out[i*4+0] = (uchar)(rX[i] & 0xFF);
-        point_out[i*4+1] = (uchar)((rX[i] >> 8) & 0xFF);
-        point_out[i*4+2] = (uchar)((rX[i] >> 16) & 0xFF);
-        point_out[i*4+3] = (uchar)((rX[i] >> 24) & 0xFF);
-    }
-    // Write Y (32 bytes LE)
-    for (int i = 0; i < 8; i++) {
-        point_out[32 + i*4+0] = (uchar)(rY[i] & 0xFF);
-        point_out[32 + i*4+1] = (uchar)((rY[i] >> 8) & 0xFF);
-        point_out[32 + i*4+2] = (uchar)((rY[i] >> 16) & 0xFF);
-        point_out[32 + i*4+3] = (uchar)((rY[i] >> 24) & 0xFF);
-    }
-    // Write Z (32 bytes LE)
-    for (int i = 0; i < 8; i++) {
-        point_out[64 + i*4+0] = (uchar)(rZ[i] & 0xFF);
-        point_out[64 + i*4+1] = (uchar)((rZ[i] >> 8) & 0xFF);
-        point_out[64 + i*4+2] = (uchar)((rZ[i] >> 16) & 0xFF);
-        point_out[64 + i*4+3] = (uchar)((rZ[i] >> 24) & 0xFF);
-    }
+    write_32bytes(point_out, 0, rX);
+    write_32bytes(point_out, 32, rY);
+    write_32bytes(point_out, 64, rZ);
 }
 
 // point_to_affine_y_wrapper: convert projective point to affine Y
@@ -179,13 +168,17 @@ __kernel void point_to_affine_y_wrapper(
     __global const uchar* point_in,  // 96 bytes (X:Y:Z)
     __global uchar* y_out            // 32 bytes LE
 ) {
-    uint X[8], Y[8], Z[8];
-    for (int i = 0; i < 8; i++) {
-        X[i] = point_in[i*4+0] | (point_in[i*4+1] << 8) | (point_in[i*4+2] << 16) | (point_in[i*4+3] << 24);
-        Y[i] = point_in[32 + i*4+0] | (point_in[32 + i*4+1] << 8) | (point_in[32 + i*4+2] << 16) | (point_in[32 + i*4+3] << 24);
-        Z[i] = point_in[64 + i*4+0] | (point_in[64 + i*4+1] << 8) | (point_in[64 + i*4+2] << 16) | (point_in[64 + i*4+3] << 24);
-    }
-    kl_point_to_affine_y(X, Y, Z, y_out);
+    ulong X[4], Y[4], Z[4];
+    read_32bytes(point_in, 0, X);
+    read_32bytes(point_in, 32, Y);
+    read_32bytes(point_in, 64, Z);
+    // Precompute T table from Z
+        ulong T[1020];
+        kl_copy_256(Z, T);
+        kl_mod_p_reduce(T);
+        for (int k = 1; k < 255; k++)
+            kl_mul_mod_p(T+(k-1)*4, T+(k-1)*4, T+k*4);
+        kl_point_to_affine_y(T, X, Y, Z, y_out);
 }
 
 // debug_pipeline: same as seed_to_ssh_ed25519_pubkey but outputs intermediate values
@@ -241,11 +234,18 @@ __kernel void debug_pipeline(
     }
 
     // 3. Scalar multiplication
-    uint rX[8], rY[8], rZ[8];
+    ulong rX[4], rY[4], rZ[4];
     kl_scalar_mult(scalar_bytes, rX, rY, rZ);
 
-    // 4. Point to affine Y
-    kl_point_to_affine_y(rX, rY, rZ, pub_out);
+    // 4. Point to affine Y (precompute T table from rZ)
+    {
+        ulong T[1020];
+        kl_copy_256(rZ, T);
+        kl_mod_p_reduce(T);
+        for (int k = 1; k < 255; k++)
+            kl_mul_mod_p(T+(k-1)*4, T+(k-1)*4, T+k*4);
+        kl_point_to_affine_y(T, rX, rY, rZ, pub_out);
+    }
     if ((rX[0] & 1u) != 0) {
         pub_out[31] |= 0x80;
     }

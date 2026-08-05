@@ -1,23 +1,23 @@
-// vanity_sshgen.cl — GPU kernel for vanity SSH key search
+// vanity_sshgen.cl - GPU kernel for vanity SSH key search
 // Includes the tested pipeline files:
-//   sha512.cl   — SHA512_H, sha512_transform, little_s0, little_s1
-//   big_math.cl — mod_p_reduce, mul_mod_p, mod_p_inverse, scalar_to_bytes
-//   ed25519.cl  — scalar_mult
-//   openssh.cl  — BASE64_TABLE (plus __kernel funcs we don't call here)
+//   sha512.cl   - SHA512_H, sha512_transform, little_s0, little_s1
+//   big_math.cl - mod_p_reduce, mul_mod_p, mod_p_inverse, scalar_to_bytes
+//   ed25519.cl  - scalar_mult
+//   openssh.cl  - BASE64_TABLE (plus __kernel funcs we don't call here)
 //
 // SEED LIFECYCLE:
 //   - CPU generates random seeds ONCE at startup, uploads to GPU (READ_WRITE)
 //   - Each work-item reads its seed, uses it, then increments by 1 (256-bit LE)
 //   - On NEXT kernel launch, the same work-item gets the already-incremented seed
-//   - NO H2D seed transfers in the main loop — seeds live and mutate on GPU
+//   - NO H2D seed transfers in the main loop - seeds live and mutate on GPU
 //
 // The kernel (per work-item):
 //   1. Load seed from seeds[idx*32..(idx+1)*32]
-//   2. SHA512(seed) → expanded[64]
-//   3. Clamp expanded[0..31] → scalar (LE interpretation, RFC 8032)
-//   4. scalar_mult → projective point (Ed25519)
-//   5. Affine Y + sign bit → 32-byte public key
-//   6. Build SSH blob + Base64 encode (51 → 68 chars)
+//   2. SHA512(seed) -> expanded[64]
+//   3. Clamp expanded[0..31] -> scalar (LE interpretation, RFC 8032)
+//   4. scalar_mult -> projective point (Ed25519)
+//   5. Affine Y + sign bit -> 32-byte public key
+//   6. Build SSH blob + Base64 encode (51 -> 68 chars)
 //   7. Match pattern in variable part (base64[pos 25+])
 //   8. If matched: write seed to foundSeeds, pattern idx to results
 //   9. Increment seed by 1 (256-bit LE with carry) back to seeds buffer
@@ -31,6 +31,10 @@
 #include "./ed25519.cl"
 #include "./openssh.cl"
 
+/* Main kernel: for each work-item, generate a vanity SSH key.
+   Pipeline: load seed -> SHA512 -> clamp -> scalar_mult -> inverse -> base64 -> pattern match.
+   Seed is incremented on each launch so the same work-item continues from where it left off.
+   Precomputed squaring chain T is built from rZ to speed up modular inverse. */
 __kernel void vanity_search(
     __global uchar* seeds,           // READ_WRITE: 32-byte LE seeds, incremented each launch
     const int numSeeds,
@@ -45,12 +49,12 @@ __kernel void vanity_search(
     int idx = (int)get_global_id(0);
     if (idx >= numSeeds) return;
 
-    // ── Load seed (256-bit LE) ─────────────────────────────────────────
+    // -- Load seed (256-bit LE) -----------------------------------------
     uchar seed[32];
     for (int i = 0; i < 32; i++)
         seed[i] = seeds[idx * 32 + i];
 
-    // ── 1. SHA512(seed) → expanded ─────────────────────────────────────
+    // -- 1. SHA512(seed) -> expanded -------------------------------------
     unsigned long state[8];
     for (int i = 0; i < 8; i++)
         state[i] = SHA512_H[i];
@@ -88,7 +92,7 @@ __kernel void vanity_search(
         expanded[i*8+7] = (uchar)v;
     }
 
-    // ── 2. Clamp ───────────────────────────────────────────────────────
+    // -- 2. Clamp -------------------------------------------------------
     uchar scalar[32];
     for (int i = 0; i < 32; i++)
         scalar[i] = expanded[i];
@@ -96,16 +100,22 @@ __kernel void vanity_search(
     scalar[31] &= 0x7F;
     scalar[31] |= 0x40;
 
-    // ── 3. scalar_mult → projective (X, Y, Z) ──────────────────────────
-    uint rX[8], rY[8], rZ[8];
+    // -- 3. scalar_mult -> projective (X, Y, Z) --------------------------
+    ulong rX[4], rY[8], rZ[8];
     scalar_mult(scalar, rX, rY, rZ);
 
-    // ── 4. Affine Y + sign bit → public key ────────────────────────────
-    // Compute Z^(-1) mod p ONCE (used for both affine Y and sign bit).
-    // Avoids the double mod_p_inverse that point_to_affine_y + manual X
-    // would require (~85 mul_mod_p saved per seed).
-    uint rZi[8], rYa[8], rXi[8];
-    mod_p_inverse(rZ, rZi);
+    // -- 4. Precompute Z^(2^k) table for Montgomery inverse --------------
+    // T[k*4..k*4+3] = rZ^(2^k) for k=0..254 (flat array, 1020 bytes)
+    ulong T[1020];
+    mod_p_reduce(rZ);
+    copy_256(rZ, T);
+    for (int k = 1; k < 255; k++)
+        mul_mod_p(T+(k-1)*4, T+(k-1)*4, T+k*4);
+
+    // -- 5. Affine Y + sign bit -> public key -----------------------------
+    // Use precomputed table for mod_p_inverse
+    ulong rZi[4], rYa[8], rXi[8];
+    mod_p_inverse(T, rZi);
     mul_mod_p(rY, rZi, rYa);    // affine Y = rY / rZ mod p
     mul_mod_p(rX, rZi, rXi);    // affine X = rX / rZ mod p (for sign bit)
 
@@ -117,7 +127,7 @@ __kernel void vanity_search(
     for (int i = 0; i < 32; i++)
         pubKeyOut[idx * 32 + i] = pubkey[i];
 
-    // ── 5. Build SSH blob (51 bytes) ───────────────────────────────────
+    // -- 5. Build SSH blob (51 bytes) -----------------------------------
     uchar blob[51];
     blob[0] = 0x00; blob[1] = 0x00; blob[2] = 0x00; blob[3] = 0x0B;
     blob[4] = 's';  blob[5] = 's';  blob[6] = 'h';  blob[7] = '-';
@@ -127,7 +137,7 @@ __kernel void vanity_search(
     for (int i = 0; i < 32; i++)
         blob[19 + i] = pubkey[i];
 
-    // ── 6. Base64 encode (51 bytes → 68 chars) ─────────────────────────
+    // -- 6. Base64 encode (51 bytes -> 68 chars) -------------------------
     uchar b64[72];
     int bpos = 0;
     for (int i = 0; i < 17; i++) {
@@ -141,7 +151,7 @@ __kernel void vanity_search(
         b64[bpos++] = BASE64_TABLE[ t        & 0x3F];
     }
 
-    // ── 7. Pattern matching (variable part, pos >= 25) ─────────────────
+    // -- 7. Pattern matching (variable part, pos >= 25) -----------------
     int foundPat = -1;
     for (int p = 0; p < numPatterns && foundPat < 0; p++) {
         uchar plen = patternLens[p];
@@ -163,7 +173,7 @@ __kernel void vanity_search(
         }
     }
 
-    // ── 8. Write results ──────────────────────────────────────────────
+    // -- 8. Write results ----------------------------------------------
     results[idx] = foundPat;
     if (foundPat >= 0) {
         // Write the MATCHING seed (BEFORE increment) so CPU can reproduce it
@@ -171,9 +181,9 @@ __kernel void vanity_search(
             foundSeeds[idx * 32 + i] = seed[i];
     }
 
-    // ── 9. Increment seed by 1 (256-bit LE with carry) ────────────────
+    // -- 9. Increment seed by 1 (256-bit LE with carry) ----------------
     // Each work-item owns its seed and increments it independently.
-    // No synchronization needed — work-items don't share seed indices.
+    // No synchronization needed - work-items don't share seed indices.
     {
         unsigned carry = 1;
         for (int i = 0; i < 32; i++) {

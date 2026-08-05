@@ -193,6 +193,7 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
 | Hardware | Cores used (-w) | Cores ALL | ~ keys per second |
 ---|---|---|---|
 | Celeron 633 [env-ed25519-translation] | 1 | 1 | 33 |
+| Celeron 433 [native x86 python 3.8.10] | 1 | 1 | 275 |
 | AMD Turion II Neo N40 | 2 | 2 | 8 000 |
 | Raspberry Pi 4 Model B Rev 1.5 [ARM]  | 4 | 4 | 10 000 |
 | Core i5 CPU  650  @ 3.20GHz  | 4 | 4 | 22 000 |

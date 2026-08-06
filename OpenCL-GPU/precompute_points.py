@@ -10,7 +10,11 @@ Uses the SAME projective addition formula from ed25519.cl:
   Z3=S*T
 All arithmetic mod p = 2^255 - 19.
 
-Outputs __constant ulong ED_TABLE[3072] formatted as hex ULL literals.
+Computation uses projective coordinates for correctness (chain addition).
+Output is converted to AFFINE coordinates (x=X/Z, y=Y/Z) to match
+the ed25519.cl table format: 8 ulong entries per point (4 x + 4 y).
+
+Outputs __constant ulong ED_TABLE[2048] formatted as hex ULL literals.
 """
 
 import sys
@@ -249,32 +253,39 @@ def hex_limbs(val):
 
 
 def output_constant(table):
-    """Print the __constant ulong ED_TABLE[3072] declaration."""
+    """Print the __constant ulong ED_TABLE[2048] declaration (affine coords).
+
+    Converts each projective point (X, Y, Z) to affine (x, y) and outputs
+    8 ulong entries per point: 4 x limbs + 4 y limbs.
+    This matches the format expected by ed25519.cl scalar_mult().
+    """
     print("// Ed25519 precomputed scalar multiples of base point B")
-    print("//  k*B stored as (X, Y, Z) in projective coords, mod p = 2^255 - 19")
-    print("//  Each point: 4 X limbs + 4 Y limbs + 4 Z limbs = 12 ulong entries")
-    print("//  ED_TABLE[k*12 +  0.. 3] = X(k*B)")
-    print("//  ED_TABLE[k*12 +  4.. 7] = Y(k*B)")
-    print("//  ED_TABLE[k*12 +  8..11] = Z(k*B)")
-    print("//  256 points x 12 limbs = 3072 total entries")
+    print("//  k*B stored as (x, y) in AFFINE coords, mod p = 2^255 - 19")
+    print("//  Each point: 4 x limbs + 4 y limbs = 8 ulong entries")
+    print("//  ED_TABLE[k*8 + 0..3] = x(k*B)")
+    print("//  ED_TABLE[k*8 + 4..7] = y(k*B)")
+    print("//  256 points x 8 limbs = 2048 total entries")
+    print("//  Table size: 2048 x 8 = 16384 bytes = 16 KB")
     print("// Curve constants (for reference):")
     print("//  P = 2^255 - 19")
     print("//  D = {}".format(hex_limbs(D) + " | " + hex_limbs(D >> 64) + " | " + hex_limbs(D >> 128) + " | " + hex_limbs(D >> 192)))
     print("//  Bx= {}".format(hex_limbs(ED_BASE_X) + " | " + hex_limbs(ED_BASE_X >> 64) + " | " + hex_limbs(ED_BASE_X >> 128) + " | " + hex_limbs(ED_BASE_X >> 192)))
     print("//  By= {}".format(hex_limbs(ED_BASE_Y) + " | " + hex_limbs(ED_BASE_Y >> 64) + " | " + hex_limbs(ED_BASE_Y >> 128) + " | " + hex_limbs(ED_BASE_Y >> 192)))
     print()
-    print("__constant ulong ED_TABLE[3072] = {")
+    print("__constant ulong ED_TABLE[2048] = {")
 
     total = 0
     for k in range(256):
         X, Y, Z = table[k]
-        limbs = to_limbs(X) + to_limbs(Y) + to_limbs(Z)
+        # Convert projective -> affine
+        xa, ya = to_affine(X, Y, Z)
+        limbs = to_limbs(xa) + to_limbs(ya)
         line = "    " + ", ".join(hex_limbs(l) for l in limbs)
         if k < 255:
             print(line + ",")
         else:
             print(line)
-        total += 12
+        total += 8
 
     print("};")
     print("// Total entries: {}".format(total))

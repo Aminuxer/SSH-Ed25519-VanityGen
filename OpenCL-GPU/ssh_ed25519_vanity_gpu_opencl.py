@@ -4,7 +4,7 @@
 Ed-25519 SSH Vanity Key Generator [OpenCL GPU]
 Port of ssh_ed25519_vanity_multicpu.py to GPU via OpenCL.
 ** Inspired by Aminuxer
-** Version: 2026-08-06--N-GPU
+** Version: 2026-08-07--N-GPU
 
 Usage:
     python3 ssh_ed25519_vanity_gpu_opencl.py <pattern> [-i] [-w <workers>] [-o output] [--debug]
@@ -24,6 +24,57 @@ import numpy as np
 from multiprocessing import Process, Queue, Event, Array
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
+
+
+# --- OpenCL kernel inliner -----------------------------------------------
+
+"""Recursively inline #include directives and apply NVIDIA OpenCL 1.2 compatibility fixes.
+
+NVIDIA OpenCL 1.2 does NOT support:
+  - __generic   (OpenCL 2.0 address-space qualifier)  → removed
+  - __inline                           → replaced with "inline"
+  - unsigned long long (ULL suffix)    → stripped
+"""
+def inline_cl(filepath, basedir, visited=None):
+    """Recursively inline #include directives from the given .cl file.
+
+    Returns the fully inlined and NVIDIA-compatible source as a string.
+    """
+    if visited is None:
+        visited = set()
+
+    bname = os.path.basename(filepath)
+    if bname in visited:
+        return ""
+    visited.add(bname)
+
+    # Resolve relative path
+    if not os.path.isabs(filepath):
+        filepath = os.path.join(basedir, filepath)
+
+    if not os.path.isfile(filepath):
+        raise FileNotFoundError(f"Include file not found: {filepath}")
+
+    lines = []
+    file_basedir = os.path.dirname(filepath)
+    with open(filepath, 'r') as f:
+        for line in f:
+            m = re.match(r'\s*#include\s+[\"\'](.*)[\"\']', line)
+            if m:
+                inc = m.group(1)
+                if '/' in inc:
+                    inc_basedir = os.path.join(file_basedir, os.path.dirname(inc))
+                else:
+                    inc_basedir = file_basedir
+                lines.append(inline_cl(inc, inc_basedir, visited))
+            else:
+                # NVIDIA OpenCL 1.2 compatibility
+                line = line.replace('__generic', '')
+                line = line.replace('__inline', 'inline')
+                line = line.replace('ULL', '')
+                lines.append(line)
+
+    return "".join(lines)
 
 # Valid Base64 characters for OpenSSH public key
 B64_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
@@ -122,8 +173,8 @@ def worker_gpu(device_idx, patterns, case_insensitive,
         ctx = cl.Context([device])
         queue = cl.CommandQueue(ctx)
 
-        with open(kernel_path, 'r') as f:
-            kernel_src = f.read()
+        kernel_dir = os.path.dirname(kernel_path)
+        kernel_src = inline_cl(kernel_path, kernel_dir)
         program = cl.Program(ctx, kernel_src).build()
         kernel = cl.Kernel(program, 'vanity_search')
 
@@ -157,17 +208,27 @@ def worker_gpu(device_idx, patterns, case_insensitive,
     seeds_np = np.frombuffer(os.urandom(batch_size * 32), dtype=np.uint8)
     cl.enqueue_copy(queue, seeds_buf, seeds_np, is_blocking=True)
 
-    # Host-side read buffers
-    results_np    = np.empty(batch_size, dtype=np.int32)
+    # -- P0: Double-buffered pipeline (single queue, ping-pong) ----------
+    # Pipeline: [Kernel N] -> [D2H N] queued, then wait D2H N-1, process N-1.
+    # GPU computes batch N while CPU processes results of batch N-1.
+    results_A = np.empty(batch_size, dtype=np.int32)
+    results_B = np.empty(batch_size, dtype=np.int32)
     found_seeds_np = np.empty(batch_size * 32, dtype=np.uint8)
+
+    # Ping-pong pointers: curr = buffer for next D2H, prev = buffer to process
+    curr_results = results_A
+    prev_results = results_B
+    # pending_evt: event for D2H of "curr" that will become "prev" next iter
+    pending_evt = None
 
     iterations = 0
     last_prog_time = time.monotonic()
     matched_count = 0
+    last_prog_iter = 0
 
     try:
         while not stop_event.is_set():
-            # -- Launch kernel (seeds are incremented IN-PLACE on GPU) --
+            # -- 1. Launch kernel (GPU starts computing batch N) ---------
             kernel.set_args(
                 seeds_buf,
                 np.int32(batch_size),
@@ -180,21 +241,26 @@ def worker_gpu(device_idx, patterns, case_insensitive,
                                        (batch_size,),
                                        (local_size,))
 
-            # -- Download results (async D2H, then sync) ----------------
-            cl.enqueue_copy(queue, results_np, results_buf)
-            queue.finish()
+            # -- 2. Queue D2H for current batch (async, non-blocking) ----
+            copy_evt = cl.enqueue_copy(queue, curr_results, results_buf,
+                                        is_blocking=False)
 
+            # -- 3. Wait for previous batch's D2H to complete -----------
+            if pending_evt is not None:
+                pending_evt.wait()
+
+            # -- 4. Process PREVIOUS batch results on CPU ---------------
             iterations += batch_size
 
-            # -- Check results for matches (vectorized) -----------------
-            match_indices = np.where(results_np >= 0)[0]
+            match_indices = np.where(prev_results >= 0)[0]
             if len(match_indices) > 0:
-                # Download found seeds (only once per batch, not per match)
+                # P3: download found seeds async + explicit finish
                 cl.enqueue_copy(queue, found_seeds_np, found_seeds_buf,
-                                is_blocking=True)
+                                is_blocking=False)
+                queue.finish()
 
                 for i in match_indices:
-                    pat_idx = int(results_np[i])
+                    pat_idx = int(prev_results[i])
                     try:
                         with found_flags.get_lock():
                             if found_flags[pat_idx] == 0:
@@ -211,6 +277,10 @@ def worker_gpu(device_idx, patterns, case_insensitive,
                         'iterations': iterations,
                     }))
                     matched_count += 1
+
+            # -- 5. Swap ping-pong buffers for next iteration -----------
+            curr_results, prev_results = prev_results, curr_results
+            pending_evt = copy_evt
 
             # Progress reporting (every ~5 seconds)
             now = time.monotonic()

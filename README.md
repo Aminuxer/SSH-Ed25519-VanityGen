@@ -193,6 +193,7 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
 | Hardware | Cores used (-w) | Cores ALL | ~ keys per second |
 ---|---|---|---|
 | Celeron 633 [env-ed25519-translation] | 1 | 1 | 33 |
+| Celeron 633 [native x86 python 3.8.10] | 1 | 1 | 261 |
 | Celeron 433 [native x86 python 3.8.10] | 1 | 1 | 275 |
 | AMD Turion II Neo N40 | 2 | 2 | 8 000 |
 | Raspberry Pi 4 Model B Rev 1.5 [ARM]  | 4 | 4 | 10 000 |
@@ -206,6 +207,13 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
 | Apple Silicon M4 CPU [ARM]  | 10 | 10 |  75 000  |
 | Xeon CPU E5-2670 2.60GHz  | 20 | 32 | 140 000 |
 | 2x AMD EPYC 9334 3.90 GHz | 128 | 128 | 640 000 |
+
+##### GPU:
+
+| Hardware | CU * WG | Cores ALL | ~ keys per second |
+---|---|---|---|
+| GTX 1070 | 15 * 1024 | 15360 | 320 000 |
+| GTX 1080 Ti | 28 * 1024 | 28672 | 590 000 |
 
 * How many keys need brute until found key ?
   - You can calucate math-estimate by formula :

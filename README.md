@@ -197,15 +197,16 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
 | Celeron 433 [native x86 python 3.8.10] | 1 | 1 | 275 |
 | AMD Turion II Neo N40 | 2 | 2 | 8 000 |
 | Raspberry Pi 4 Model B Rev 1.5 [ARM]  | 4 | 4 | 10 000 |
-| Core i5 CPU  650  @ 3.20GHz  | 4 | 4 | 22 000 |
-| Celeron G9300 2.80 GH | 2 | 2 | 30 000 |
+| Core i5 650 3.20 GHz  | 4 | 4 | 22 000 |
+| Celeron G9300 2.80 GHz | 2 | 2 | 30 000 |
 | Xeon X3450 2.67GHz | 8 | 8 | 37 000 |
 | AMD Opteron(tm) Processor 2386 SE | 8 | 8 | 44 000 |
-| Core-i7 2700K  | 8 | 8 | 45 000 |
-| Core i7-6700HQ 2.60GHz  | 8 | 8 |  63 000  |
-| Core i7-7700K 4.50GHz  | 8 | 8 |  67 000  |
+| Core-i7 2700K 3.40 GHz | 8 | 8 | 45 000 |
+| Core i7-6700HQ 2.60 GHz  | 8 | 8 |  63 000  |
+| Core i7-7700K 4.50 GHz  | 8 | 8 |  67 000  |
 | Apple Silicon M4 CPU [ARM]  | 10 | 10 |  75 000  |
-| Xeon CPU E5-2670 2.60GHz  | 20 | 32 | 140 000 |
+| Xeon CPU E5-2670 2.60 GHz  | 20 | 32 | 140 000 |
+| 2x AMD EPYC 7502 3.35 GHz | 128 | 128 | 315 000 |
 | 2x AMD EPYC 9334 3.90 GHz | 128 | 128 | 640 000 |
 
 ##### GPU:

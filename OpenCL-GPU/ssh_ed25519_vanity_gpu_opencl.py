@@ -174,9 +174,12 @@ def worker_gpu(device_idx, patterns, case_insensitive,
         queue = cl.CommandQueue(ctx)
 
         kernel_dir = os.path.dirname(kernel_path)
+        print(f"[+] Compiling OpenCL kernel on GPU [{device_idx}] {dev_name} ...", flush=True)
         kernel_src = inline_cl(kernel_path, kernel_dir)
         program = cl.Program(ctx, kernel_src).build()
         kernel = cl.Kernel(program, 'vanity_search')
+        # Signal main process that this worker is ready
+        result_queue.put(('ready', device_idx))
 
         # Determine work size
         max_wg = device.get_info(cl.device_info.MAX_WORK_GROUP_SIZE)
@@ -211,8 +214,8 @@ def worker_gpu(device_idx, patterns, case_insensitive,
     # -- P0: Double-buffered pipeline (single queue, ping-pong) ----------
     # Pipeline: [Kernel N] -> [D2H N] queued, then wait D2H N-1, process N-1.
     # GPU computes batch N while CPU processes results of batch N-1.
-    results_A = np.empty(batch_size, dtype=np.int32)
-    results_B = np.empty(batch_size, dtype=np.int32)
+    results_A = np.full(batch_size, -1, dtype=np.int32)
+    results_B = np.full(batch_size, -1, dtype=np.int32)
     found_seeds_np = np.empty(batch_size * 32, dtype=np.uint8)
 
     # Ping-pong pointers: curr = buffer for next D2H, prev = buffer to process
@@ -386,7 +389,25 @@ def generate_vanity_key(patterns, case_insensitive=False,
         p.start()
         processes.append(p)
 
-    # Monitor loop
+    # Wait for all workers to finish kernel compilation
+    ready_count = 0
+    start_compile = time.monotonic()
+    while ready_count < len(processes):
+        try:
+            msg_type, data = result_queue.get(timeout=3)
+            if msg_type == 'ready':
+                ready_count += 1
+                elapsed_compile = time.monotonic() - start_compile
+                if elapsed_compile > 2.0:
+                    print(f"[+] GPU [{data}] ready ({elapsed_compile:.1f}s compile)", flush=True)
+            elif msg_type == 'error':
+                print(f"[-] Worker error during init: {data}")
+                stop_event.set()
+                break
+        except Exception:
+            continue
+
+    # Monitor loop (starts ONLY after all kernels are compiled)
     total_iterations = 0
     start_time = time.monotonic()
     last_prog_time = start_time

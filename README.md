@@ -16,7 +16,7 @@ Python-3 multiprocessing + OpenCL (pyopencl) version. Load only OpenCL cores (GP
 
 ## Installation and requirements
 
-0). Dependencies;
+##### 0). Dependencies;
 
 CPU-version:  Python 3.6+; python3-cryptography 2.5+
 
@@ -32,7 +32,7 @@ or
 pip3 install python3-cryptography
 ```
 
-1). For GPU-OpenCL version install also python3-pyopencl and python3-numpy.
+##### 1). For GPU-OpenCL version install also python3-pyopencl and python3-numpy.
 ```
 dnf install python3-opencl python3-numpy
 or
@@ -41,6 +41,7 @@ or
 pip3 install python3-opencl python3-numpy
 ```
 If your environment contain too old version, try use script **_pip-install-deps.sh**.
+
 Running vanity-gen under separated user profile is good practice.
 
 #### Check versions
@@ -67,7 +68,7 @@ pip3 install "pyopencl>=2026.1"
 pip3 install "numpy"
 ```
 
-1). Run command for generate key:
+##### 1). Run command for generate key:
 On CPU only:
 ```
 python3 ssh_ed25519_vanity_multicpu.py User

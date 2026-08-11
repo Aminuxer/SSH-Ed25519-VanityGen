@@ -17,8 +17,11 @@
 ## Установка и системные требования.
 
 ##### 0). Зависимости;
+
 CPU-версия: Минимум Python 3.6+; python3-cryptography 2.5+;
+
 GPU-версия: Минимум Python 3.12+; python3-cryptography 3.1+; python3-pyopencl 2026.1+;
+
 
 Установите python3-пакет *python3-cryptography* с помощаью пакетного менеджера ОС или утилиты pip3.
 ```

@@ -32,13 +32,13 @@ or
 pip3 install python3-cryptography
 ```
 
-##### 1). Для версии под GPU-OpenCL (видеокарты, FPGA) также установите python3-pyopencl и python3-numpy.
+##### 1). Для версии под GPU-OpenCL (видеокарты, FPGA) также установите python3-pyopencl.
 ```
-dnf install python3-opencl python3-numpy
+dnf install python3-opencl
 or
-apt install python3-opencl python3-numpy
+apt install python3-opencl
 or
-pip3 install python3-opencl python3-numpy
+pip3 install python3-opencl
 ```
 
 Если версии пакетов в вашей системе слышком старые, попробуйте сперва скрипт **_pip-install-deps.sh**.
@@ -53,7 +53,6 @@ python3 -c "import cryptography; print('cryptography:', cryptography.__version__
 
 # GPU-версия
 python3 -c "import pyopencl; print('pyopencl:', pyopencl.__version__)"
-python3 -c "import numpy; print('numpy:', numpy.__version__)"
 ```
 
 #### PIP3-установка
@@ -62,7 +61,6 @@ pip3 install "cryptography>=2.5"
 Для GPU также дополнительно:
 ```
 pip3 install "pyopencl>=2026.1"
-pip3 install "numpy"
 ```
 
 ##### 1). Запустите команду для генерации ключа:

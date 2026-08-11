@@ -18,9 +18,9 @@ Python-3 multiprocessing + OpenCL (pyopencl) version. Load only OpenCL cores (GP
 
 ##### 0). Dependencies;
 
-CPU-version:  Python 3.6+; python3-cryptography 2.5+
+CPU-version:  **Python 3.6+**; **python3-cryptography 2.5+**
 
-GPU-version: Python 3.12+; python3-cryptography 3.1+, python3-pyopencl-2026.1+, python3-numpy;
+GPU-version: **Python 3.12+**; **python3-cryptography 3.1+**, **python3-pyopencl-2026.1+**, **python3-numpy**;
 
 
 Install python3 package *python3-cryptography* with OS package manager or over pip3 tool.
@@ -242,6 +242,8 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
 | 9 | 346850820453631 | 1152213485199650 | 2304426970399298 | 3456640455599000 |
 | 10 | 22832694009290500 | 75848567711428400 | 151697135422857000 | 227545703134289000 |
 
+* My hardware too old (i686) and python too old also (3.6).
+  - Run CPU-version with --debug option for benchmark; Use seed (this data is secret !!) for generate keypair on more fresh equipment;
 
 * It's really 100% vibe coding ?
   - Yes. QWEN-Coder-Next 80B/3B

@@ -243,7 +243,8 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
 | 10 | 22832694009290500 | 75848567711428400 | 151697135422857000 | 227545703134289000 |
 
 * My hardware too old (i686) and python too old also (3.6).
-  - Run CPU-version with --debug option for benchmark; Use seed (this data is secret !!) for generate keypair on more fresh equipment;
+  - Run CPU-version with --debug option for benchmark;
+  - Use seed (this data is secret !!) for generate keypair wuth **seed-2-openssh-key.py** on more fresh equipment;
 
 * It's really 100% vibe coding ?
   - Yes. QWEN-Coder-Next 80B/3B

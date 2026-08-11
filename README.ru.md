@@ -16,7 +16,7 @@
 
 ## Установка и системные требования.
 
-0). Зависимости;
+##### 0). Зависимости;
 CPU-версия: Минимум Python 3.6+; python3-cryptography 2.5+;
 GPU-версия: Минимум Python 3.12+; python3-cryptography 3.1+; python3-pyopencl 2026.1+;
 
@@ -29,7 +29,7 @@ or
 pip3 install python3-cryptography
 ```
 
-1). Для версии под GPU-OpenCL (видеокарты, FPGA) также установите python3-pyopencl и python3-numpy.
+##### 1). Для версии под GPU-OpenCL (видеокарты, FPGA) также установите python3-pyopencl и python3-numpy.
 ```
 dnf install python3-opencl python3-numpy
 or
@@ -39,6 +39,7 @@ pip3 install python3-opencl python3-numpy
 ```
 
 Если версии пакетов в вашей системе слышком старые, попробуйте сперва скрипт **_pip-install-deps.sh**.
+
 Хорошей практикой считается запуск ванити-генератора от имени отдельного пользователя в системе.
 
 #### Проверка версий
@@ -61,7 +62,7 @@ pip3 install "pyopencl>=2026.1"
 pip3 install "numpy"
 ```
 
-1). Запустите команду для генерации ключа:
+##### 1). Запустите команду для генерации ключа:
 Пример с использованием только CPU:
 ```
 python3 ssh_ed25519_vanity_multicpu.py User

@@ -209,6 +209,7 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
 | Core i7-7700K 4.50 GHz  | 8 | 8 |  67 000  |
 | Apple Silicon M4 CPU [ARM]  | 10 | 10 |  75 000  |
 | Xeon CPU E5-2670 2.60 GHz | 20 | 32 | 140 000 |
+| 2x Xeon CPU E5-2667 v4 3.60 GHz  | 32 | 32 | 232 000 |
 | 2x AMD EPYC 7502 3.35 GHz | 128 | 128 | 315 000 |
 | 2x AMD EPYC 9334 3.90 GHz | 128 | 128 | 640 000 |
 

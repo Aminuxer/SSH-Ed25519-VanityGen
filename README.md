@@ -20,7 +20,7 @@ Python-3 multiprocessing + OpenCL (pyopencl) version. Load only OpenCL cores (GP
 
 CPU-version:  **Python 3.6+**; **python3-cryptography 2.5+**
 
-GPU-version: **Python 3.12+**; **python3-cryptography 3.1+**, **python3-pyopencl-2026.1+**, **python3-numpy**;
+GPU-version: **Python 3.12+**; **python3-cryptography 3.1+**, **python3-pyopencl-2026.1+**;
 
 
 Install python3 package *python3-cryptography* with OS package manager or over pip3 tool.
@@ -32,13 +32,13 @@ or
 pip3 install python3-cryptography
 ```
 
-##### 1). For GPU-OpenCL version install also python3-pyopencl and python3-numpy.
+##### 1). For GPU-OpenCL version install python3-pyopencl.
 ```
-dnf install python3-opencl python3-numpy
+dnf install python3-opencl
 or
-apt install python3-opencl python3-numpy
+apt install python3-opencl
 or 
-pip3 install python3-opencl python3-numpy
+pip3 install python3-opencl
 ```
 If your environment contain too old version, try use script **_pip-install-deps.sh**.
 
@@ -52,7 +52,6 @@ python3 -c "import cryptography; print('cryptography:', cryptography.__version__
 
 # Also check for GPU version
 python3 -c "import pyopencl; print('pyopencl:', pyopencl.__version__)"
-python3 -c "import numpy; print('numpy:', numpy.__version__)"
 ```
 
 #### PIP-install
@@ -65,7 +64,6 @@ pip3 install "cryptography>=2.5"
 For GPU:
 ```
 pip3 install "pyopencl>=2026.1"
-pip3 install "numpy"
 ```
 
 ##### 1). Run command for generate key:

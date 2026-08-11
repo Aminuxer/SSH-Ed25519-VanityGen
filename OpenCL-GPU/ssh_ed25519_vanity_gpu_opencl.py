@@ -4,7 +4,7 @@
 Ed-25519 SSH Vanity Key Generator [OpenCL GPU]
 Port of ssh_ed25519_vanity_multicpu.py to GPU via OpenCL.
 ** Inspired by Aminuxer
-** Version: 2026-08-07--N-GPU
+** Version: 2026-08-12--N-GPU
 
 Usage:
     python3 ssh_ed25519_vanity_gpu_opencl.py <pattern> [-i] [-w <workers>] [-o output] [--debug]
@@ -19,14 +19,13 @@ import os
 import sys
 import time
 import re
+import array
+import struct
+import ctypes
 import pyopencl as cl
-import numpy as np
 from multiprocessing import Process, Queue, Event, Array
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
-
-
-# --- OpenCL kernel inliner -----------------------------------------------
 
 """Recursively inline #include directives and apply NVIDIA OpenCL 1.2 compatibility fixes.
 
@@ -155,9 +154,9 @@ def worker_gpu(device_idx, patterns, case_insensitive,
         pat_lens.append(len(pbytes))
         pat_ci.append(1 if case_insensitive else 0)
 
-    pat_bytes_np = np.frombuffer(bytes(pat_bytes), dtype=np.uint8)
-    pat_lens_np  = np.frombuffer(bytes(pat_lens),  dtype=np.uint8)
-    pat_ci_np    = np.frombuffer(bytes(pat_ci),    dtype=np.uint8)
+    pat_bytes_np = bytearray(bytes(pat_bytes))
+    pat_lens_np  = bytearray(bytes(pat_lens))
+    pat_ci_np    = bytearray(bytes(pat_ci))
 
     # Init OpenCL
     try:
@@ -208,15 +207,16 @@ def worker_gpu(device_idx, patterns, case_insensitive,
     pat_ci_buf    = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pat_ci_np)
 
     # -- Generate random seeds ONCE and upload ONCE ---------------------
-    seeds_np = np.frombuffer(os.urandom(batch_size * 32), dtype=np.uint8)
+    seeds_np = bytearray(os.urandom(batch_size * 32))
     cl.enqueue_copy(queue, seeds_buf, seeds_np, is_blocking=True)
 
     # -- P0: Double-buffered pipeline (single queue, ping-pong) ----------
     # Pipeline: [Kernel N] -> [D2H N] queued, then wait D2H N-1, process N-1.
     # GPU computes batch N while CPU processes results of batch N-1.
-    results_A = np.full(batch_size, -1, dtype=np.int32)
-    results_B = np.full(batch_size, -1, dtype=np.int32)
-    found_seeds_np = np.empty(batch_size * 32, dtype=np.uint8)
+    neg1 = struct.pack("<" + "i" * batch_size, *([-1] * batch_size))
+    results_A = array.array("i", neg1)
+    results_B = array.array("i", neg1)
+    found_seeds_np = bytearray(batch_size * 32)
 
     # Ping-pong pointers: curr = buffer for next D2H, prev = buffer to process
     curr_results = results_A
@@ -234,9 +234,9 @@ def worker_gpu(device_idx, patterns, case_insensitive,
             # -- 1. Launch kernel (GPU starts computing batch N) ---------
             kernel.set_args(
                 seeds_buf,
-                np.int32(batch_size),
+                ctypes.c_int32(batch_size),
                 pat_bytes_buf, pat_lens_buf, pat_ci_buf,
-                np.int32(pat_count),
+                ctypes.c_int32(pat_count),
                 results_buf, pubkey_buf,
                 found_seeds_buf,
             )
@@ -255,7 +255,7 @@ def worker_gpu(device_idx, patterns, case_insensitive,
             # -- 4. Process PREVIOUS batch results on CPU ---------------
             iterations += batch_size
 
-            match_indices = np.where(prev_results >= 0)[0]
+            match_indices = tuple(i for i, x in enumerate(prev_results) if x >= 0)
             if len(match_indices) > 0:
                 # P3: download found seeds async + explicit finish
                 cl.enqueue_copy(queue, found_seeds_np, found_seeds_buf,
@@ -273,7 +273,7 @@ def worker_gpu(device_idx, patterns, case_insensitive,
                     except Exception:
                         continue
 
-                    seed_hex = found_seeds_np[i*32:(i+1)*32].tobytes().hex()
+                    seed_hex = found_seeds_np[i*32:(i+1)*32].hex()
                     result_queue.put(('found', {
                         'pattern_idx': pat_idx,
                         'seed': seed_hex,

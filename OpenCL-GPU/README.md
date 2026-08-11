@@ -14,7 +14,6 @@ This project implements an SSH ED25519 vanity key generator using **OpenCL GPU a
 
 #### Required:
 * python3-pyopencl >= 2026.1
-* python3-numpy
 * python3-cryptography >= 3.1
 
 

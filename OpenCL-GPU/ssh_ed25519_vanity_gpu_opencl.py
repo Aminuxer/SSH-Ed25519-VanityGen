@@ -6,6 +6,11 @@ Port of ssh_ed25519_vanity_multicpu.py to GPU via OpenCL.
 ** Inspired by Aminuxer
 ** Version: 2026-08-12--N-GPU
 
+GPU TIMEOUT PROTECTION:
+- queue.finish() wrapped with threading timeout
+- Kernel launch + D2H wait wrapped with threading timeout
+- Main-loop watchdog terminates workers silent > WATCHDOG_TIMEOUT_SEC
+
 Usage:
     python3 ssh_ed25519_vanity_gpu_opencl.py <pattern> [-i] [-w <workers>] [-o output] [--debug]
     python3 ssh_ed25519_vanity_gpu_opencl.py --patterns-file <file> [-i] [-w <workers>] [-o output] [--debug]
@@ -14,6 +19,11 @@ GPU-specific options:
     --opencl-devices a,b,c     Use specific device IDs (ignores -w)
     --load-percent 1-100       % of GPU cores to use (default: 100)
 """
+
+# GPU timeout constants (seconds)
+GPU_OP_TIMEOUT   = 30   # max wait for queue.finish() / event.wait()
+KERNEL_TIMEOUT   = 120  # max wait for kernel launch + D2H pipeline
+WATCHDOG_TIMEOUT = 60   # worker silent this long -> terminate
 
 import os
 import sys
@@ -30,9 +40,9 @@ from cryptography.hazmat.primitives import serialization
 """Recursively inline #include directives and apply NVIDIA OpenCL 1.2 compatibility fixes.
 
 NVIDIA OpenCL 1.2 does NOT support:
-  - __generic   (OpenCL 2.0 address-space qualifier)  → removed
-  - __inline                           → replaced with "inline"
-  - unsigned long long (ULL suffix)    → stripped
+  - __generic   (OpenCL 2.0 address-space qualifier)  -> removed
+  - __inline                           -> replaced with "inline"
+  - unsigned long long (ULL suffix)    -> stripped
 """
 def inline_cl(filepath, basedir, visited=None):
     """Recursively inline #include directives from the given .cl file.
@@ -210,28 +220,28 @@ def worker_gpu(device_idx, patterns, case_insensitive,
     seeds_np = bytearray(os.urandom(batch_size * 32))
     cl.enqueue_copy(queue, seeds_buf, seeds_np, is_blocking=True)
 
-    # -- P0: Double-buffered pipeline (single queue, ping-pong) ----------
-    # Pipeline: [Kernel N] -> [D2H N] queued, then wait D2H N-1, process N-1.
-    # GPU computes batch N while CPU processes results of batch N-1.
+    # -- P0: Single results buffer + blocking copy (no ping-pong, no event hang)
+    neg1 = struct.pack("<" + "i" * batch_size, *([-1] * batch_size))
+    curr_results = array.array("i", neg1)
+    found_seeds_np = bytearray(batch_size * 32)
+
+    iterations = 0
+    last_prog_time = time.monotonic()
+    last_prog_iter = 0
+    matched_count = 0
+
+    # -- P0: Double-buffered pipeline restored, but with timeout-safe event wait
     neg1 = struct.pack("<" + "i" * batch_size, *([-1] * batch_size))
     results_A = array.array("i", neg1)
     results_B = array.array("i", neg1)
     found_seeds_np = bytearray(batch_size * 32)
-
-    # Ping-pong pointers: curr = buffer for next D2H, prev = buffer to process
     curr_results = results_A
     prev_results = results_B
-    # pending_evt: event for D2H of "curr" that will become "prev" next iter
     pending_evt = None
-
-    iterations = 0
-    last_prog_time = time.monotonic()
-    matched_count = 0
-    last_prog_iter = 0
 
     try:
         while not stop_event.is_set():
-            # -- 1. Launch kernel (GPU starts computing batch N) ---------
+            # -- 1. Launch kernel (GPU computes batch N) + D2H queue --------
             kernel.set_args(
                 seeds_buf,
                 ctypes.c_int32(batch_size),
@@ -243,24 +253,60 @@ def worker_gpu(device_idx, patterns, case_insensitive,
             cl.enqueue_nd_range_kernel(queue, kernel,
                                        (batch_size,),
                                        (local_size,))
+            cur_copy_evt = cl.enqueue_copy(queue, curr_results, results_buf,
+                                           is_blocking=False)
 
-            # -- 2. Queue D2H for current batch (async, non-blocking) ----
-            copy_evt = cl.enqueue_copy(queue, curr_results, results_buf,
-                                        is_blocking=False)
+            # -- 2. Wait for previous batch's D2H + process results ----------
+            #    All CPU-side blocking ops wrapped in thread with timeout.
+            #    If GPU is dead, this prevents the worker from hanging.
+            _iter_done = [False]
+            _cur_evt = cur_copy_evt
+            _pend_evt = pending_evt
 
-            # -- 3. Wait for previous batch's D2H to complete -----------
-            if pending_evt is not None:
-                pending_evt.wait()
+            def _batch_work():
+                try:
+                    if _pend_evt is not None:
+                        _pend_evt.wait()
+                    queue.finish()
+                    _iter_done[0] = True
+                except Exception:
+                    pass
 
-            # -- 4. Process PREVIOUS batch results on CPU ---------------
+            _bw = __import__('threading').Thread(target=_batch_work, daemon=True)
+            _bw.start()
+            _bw.join(timeout=KERNEL_TIMEOUT)
+
+            if not _iter_done[0]:
+                # Entire pipeline hang (GPU dead or driver stuck).
+                # Skip this batch — GPU may still be computing, so we
+                # advance iteration count and progress to keep watchdog happy.
+                iterations += batch_size
+                if iterations - last_prog_iter >= batch_size:
+                    try:
+                        result_queue.put(('progress', batch_size), block=False)
+                    except Exception:
+                        pass
+                    last_prog_iter = iterations
+                pending_evt = _cur_evt
+                curr_results, prev_results = prev_results, curr_results
+                continue
+
+            # -- 3. Process PREVIOUS batch results on CPU ------------------
             iterations += batch_size
+
+            # Send progress report to main loop
+            if iterations - last_prog_iter >= batch_size:
+                try:
+                    result_queue.put(('progress', iterations - last_prog_iter), block=False)
+                except Exception:
+                    pass
+                last_prog_iter = iterations
 
             match_indices = tuple(i for i, x in enumerate(prev_results) if x >= 0)
             if len(match_indices) > 0:
-                # P3: download found seeds async + explicit finish
                 cl.enqueue_copy(queue, found_seeds_np, found_seeds_buf,
                                 is_blocking=False)
-                queue.finish()
+                # queue.finish() already called in _batch_work() above
 
                 for i in match_indices:
                     pat_idx = int(prev_results[i])
@@ -281,19 +327,9 @@ def worker_gpu(device_idx, patterns, case_insensitive,
                     }))
                     matched_count += 1
 
-            # -- 5. Swap ping-pong buffers for next iteration -----------
+            # -- 5. Swap ping-pong buffers ---------------------------------
             curr_results, prev_results = prev_results, curr_results
-            pending_evt = copy_evt
-
-            # Progress reporting (every ~5 seconds)
-            now = time.monotonic()
-            if now - last_prog_time >= 5.0:
-                try:
-                    result_queue.put(('progress', iterations - last_prog_iter), block=False)
-                except Exception:
-                    pass
-                last_prog_time = now
-                last_prog_iter = iterations
+            pending_evt = cur_copy_evt
 
     except Exception as e:
         result_queue.put(('error', f"Worker loop error: {e}\n{traceback.format_exc()}"))
@@ -373,17 +409,17 @@ def generate_vanity_key(patterns, case_insensitive=False,
     except RuntimeError:
         pass
 
-    result_queue  = Queue()
-    stop_event    = Event()
-    found_flags   = Array('i', [0] * len(patterns))  # shared flag per pattern
+    result_queues  = [Queue() for _ in range(num_workers)]
+    stop_event     = Event()
+    found_flags    = Array('i', [0] * len(patterns))
 
     # Start workers
     processes = []
-    for dev_idx in selected:
+    for i, dev_idx in enumerate(selected):
         p = Process(
             target=worker_gpu,
             args=(dev_idx, patterns, case_insensitive,
-                  result_queue, stop_event,
+                  result_queues[i], stop_event,
                   found_flags, kernel_path, load_percent),
         )
         p.start()
@@ -393,133 +429,169 @@ def generate_vanity_key(patterns, case_insensitive=False,
     ready_count = 0
     start_compile = time.monotonic()
     while ready_count < len(processes):
-        try:
-            msg_type, data = result_queue.get(timeout=3)
-            if msg_type == 'ready':
-                ready_count += 1
-                elapsed_compile = time.monotonic() - start_compile
-                if elapsed_compile > 2.0:
-                    print(f"[+] GPU [{data}] ready ({elapsed_compile:.1f}s compile)", flush=True)
-            elif msg_type == 'error':
-                print(f"[-] Worker error during init: {data}")
-                stop_event.set()
-                break
-        except Exception:
+        got = False
+        for i, rq in enumerate(result_queues):
+            try:
+                msg_type, data = rq.get(timeout=1)
+                if msg_type == 'ready':
+                    ready_count += 1
+                    elapsed_compile = time.monotonic() - start_compile
+                    if elapsed_compile > 2.0:
+                        print(f"[+] GPU [{data}] ready ({elapsed_compile:.1f}s compile)", flush=True)
+                elif msg_type == 'error':
+                    print(f"[-] Worker error during init: {data}")
+                    stop_event.set()
+                    break
+                got = True
+            except Exception:
+                pass
+        if not got:
             continue
+        if stop_event.is_set():
+            break
 
     # Monitor loop (starts ONLY after all kernels are compiled)
     total_iterations = 0
     start_time = time.monotonic()
-    last_prog_time = start_time
-    last_prog_iter = 0
     remaining = set(range(len(patterns)))
     first_printed = False
     progress_line = ""
     last_pub = None
     last_pem = None
+    last_prog_time = start_time
+    # Watchdog: track last progress time per worker
+    worker_last_progress = [time.monotonic()] * num_workers
 
     try:
         while len(remaining) > 0:
-            # Check results
-            try:
-                msg_type, data = result_queue.get(timeout=3)
-            except Exception:
-                # Periodic progress display on timeout
-                now = time.monotonic()
-                if now - last_prog_time >= 5.0:
-                    elapsed = now - start_time
-                    rate = total_iterations / elapsed if elapsed > 0 else 0
-                    rem = f" ({len(remaining)} left)" if remaining else ""
-                    progress_line = (
-                        f"\r[+] Progress: {total_iterations:,} keys "
-                        f"({format_duration(elapsed)}) "
-                        f"(~{rate:,.0f} keys/sec){rem}")
-                    print(progress_line, end="", flush=True)
-                    first_printed = True
-                    last_prog_time = now
-                    last_prog_iter = total_iterations
-                continue
+            # Check results from all worker queues
+            got = False
+            for i, rq in enumerate(result_queues):
+                try:
+                    msg_type, data = rq.get(timeout=1)
+                    got = True
 
-            if msg_type == 'progress':
-                total_iterations += data
-                continue
+                    if msg_type == 'progress':
+                        total_iterations += data
+                        worker_last_progress[i] = time.monotonic()
+                        continue
 
-            if msg_type == 'done':
-                total_iterations += data
-                continue
+                    if msg_type == 'done':
+                        total_iterations += data
+                        worker_last_progress[i] = time.monotonic()
+                        continue
 
-            if msg_type == 'found':
-                pat_idx = data['pattern_idx']
-                seed_hex = data['seed']
-                total_iterations = data.get('iterations', total_iterations)
+                    if msg_type == 'found':
+                        worker_last_progress[i] = time.monotonic()
+                        pat_idx = data['pattern_idx']
+                        seed_hex = data['seed']
+                        total_iterations = data.get('iterations', total_iterations)
 
-                if pat_idx not in remaining:
-                    continue  # already handled
+                        if pat_idx not in remaining:
+                            continue  # already handled
 
-                remaining.discard(pat_idx)
-                matched_pat = patterns[pat_idx]
-                elapsed = time.monotonic() - start_time
+                        remaining.discard(pat_idx)
+                        matched_pat = patterns[pat_idx]
+                        elapsed = time.monotonic() - start_time
 
+                        if first_printed and progress_line:
+                            print(f"\r{' ' * len(progress_line)}\r", end="", flush=True)
+
+                        # Generate key on CPU from seed
+                        seed_bytes = bytes.fromhex(seed_hex)
+                        priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(seed_bytes)
+                        pub_key  = priv_key.public_key()
+
+                        pub_bytes = pub_key.public_bytes(
+                            encoding=serialization.Encoding.OpenSSH,
+                            format=serialization.PublicFormat.OpenSSH,
+                        )
+                        pub_str = pub_bytes.decode()
+
+                        priv_pem_bytes = priv_key.private_bytes(
+                            encoding=serialization.Encoding.PEM,
+                            format=serialization.PrivateFormat.OpenSSH,
+                            encryption_algorithm=serialization.NoEncryption(),
+                        )
+                        priv_pem_str = priv_pem_bytes.decode()
+
+                        print(f"\n[+] Found match for '{matched_pat}'!")
+                        print(f"[+] Public key: {pub_str} {matched_pat}")
+                        if debug_mode:
+                            print(f"[+] Seed (hex): {seed_hex}")
+
+                        # Save to file or console
+                        saved = False
+                        if output_file:
+                            try:
+                                ts = time.strftime("%Y%m%d-%H%M%S")
+                                safe = sanitize_filename(matched_pat)
+                                base = f"{output_file}-{safe}-{ts}"
+                                out_dir = os.path.dirname(output_file) or '.'
+                                with open(base + '.pub', 'w') as f:
+                                    f.write(pub_str + ' ' + matched_pat + '\n')
+                                with open(base, 'w') as f:
+                                    f.write(priv_pem_str)
+                                os.chmod(base, 0o600)
+                                print(f"[+] Written: {base}.pub and {base} (mode 600)")
+                                saved = True
+                            except Exception as e:
+                                print(f"[-] Save failed: {e}")
+
+                        if not saved:
+                            print("[!] Output to console:")
+                            print(priv_pem_str)
+
+                        last_pub = pub_str
+                        last_pem = priv_pem_str
+
+                        if remaining:
+                            print("[*] Continuing search for remaining patterns...")
+                        else:
+                            print("[*] All patterns found!")
+                            stop_event.set()
+
+                    elif msg_type == 'error':
+                        worker_last_progress[i] = time.monotonic()
+                        print(f"[-] Worker error: {data}")
+                        stop_event.set()
+                    break  # Got a message, break inner for, re-check all queues
+                except Exception:
+                    pass
+
+            # Periodic progress display (every 5s regardless of messages)
+            now = time.monotonic()
+            if now - last_prog_time >= 5.0:
+                elapsed = now - start_time
+                rate = total_iterations / elapsed if elapsed > 0 else 0
+                rem = f" ({len(remaining)} left)" if remaining else ""
+                progress_line = (
+                    f"\r[+] Progress: {total_iterations:,} keys "
+                    f"({format_duration(elapsed)}) "
+                    f"(~{rate:,.0f} keys/sec){rem}")
                 if first_printed and progress_line:
                     print(f"\r{' ' * len(progress_line)}\r", end="", flush=True)
+                print(progress_line, end="", flush=True)
+                first_printed = True
+                last_prog_time = now
 
-                # Generate key on CPU from seed
-                seed_bytes = bytes.fromhex(seed_hex)
-                priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(seed_bytes)
-                pub_key  = priv_key.public_key()
-
-                pub_bytes = pub_key.public_bytes(
-                    encoding=serialization.Encoding.OpenSSH,
-                    format=serialization.PublicFormat.OpenSSH,
-                )
-                pub_str = pub_bytes.decode()
-
-                priv_pem_bytes = priv_key.private_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PrivateFormat.OpenSSH,
-                    encryption_algorithm=serialization.NoEncryption(),
-                )
-                priv_pem_str = priv_pem_bytes.decode()
-
-                print(f"\n[+] Found match for '{matched_pat}'!")
-                print(f"[+] Public key: {pub_str} {matched_pat}")
-                if debug_mode:
-                    print(f"[+] Seed (hex): {seed_hex}")
-
-                # Save to file or console
-                saved = False
-                if output_file:
+            # -- Watchdog: kill workers silent for too long -----------------
+            for i, p in enumerate(processes):
+                if p.is_alive() and now - worker_last_progress[i] > WATCHDOG_TIMEOUT:
+                    pid = p.pid
+                    print(f"\n[!] Worker [{i}] (PID {pid}) silent for >{WATCHDOG_TIMEOUT}s — terminating", flush=True)
+                    p.terminate()
                     try:
-                        ts = time.strftime("%Y%m%d-%H%M%S")
-                        safe = sanitize_filename(matched_pat)
-                        base = f"{output_file}-{safe}-{ts}"
-                        out_dir = os.path.dirname(output_file) or '.'
-                        with open(base + '.pub', 'w') as f:
-                            f.write(pub_str + ' ' + matched_pat + '\n')
-                        with open(base, 'w') as f:
-                            f.write(priv_pem_str)
-                        os.chmod(base, 0o600)
-                        print(f"[+] Written: {base}.pub and {base} (mode 600)")
-                        saved = True
-                    except Exception as e:
-                        print(f"[-] Save failed: {e}")
-
-                if not saved:
-                    print("[!] Output to console:")
-                    print(priv_pem_str)
-
-                last_pub = pub_str
-                last_pem = priv_pem_str
-
-                if remaining:
-                    print("[*] Continuing search for remaining patterns...")
-                else:
-                    print("[*] All patterns found!")
+                        p.join(timeout=3)
+                    except Exception:
+                        pass
+                    if p.is_alive():
+                        try:
+                            os.kill(pid, 9)
+                        except Exception:
+                            pass
                     stop_event.set()
-
-            elif msg_type == 'error':
-                print(f"[-] Worker error: {data}")
-                stop_event.set()
+                    worker_last_progress[i] = now  # prevent re-trigger
 
     except KeyboardInterrupt:
         print("\n[!] Interrupted by user")

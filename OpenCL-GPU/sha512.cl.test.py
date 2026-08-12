@@ -4,9 +4,8 @@ import sys, os, hashlib, argparse
 
 try:
     import pyopencl as cl
-    import numpy as np
 except ImportError as e:
-    print(f"Error: pyopencl and numpy required - {e}")
+    print(f"Error: pyopencl required - {e}")
     sys.exit(1)
 
 def get_opencl_device():
@@ -32,29 +31,32 @@ def parse_hex_arg(hex_str):
 def sha512_opencl(data):
     """SHA-512 using GPU - handles arbitrary length data."""
     data_len = len(data)
-    
+
     # Handle empty string case
     if data_len == 0:
         return hashlib.sha512(data).digest()  # Return known hash
-    
+
     cl_content, cl_path = load_kernel()
     device = get_opencl_device()
     ctx = cl.Context([device])
     queue = cl.CommandQueue(ctx, properties=cl.command_queue_properties.PROFILING_ENABLE)
     prg = cl.Program(ctx, cl_content).build()
-    
-    data_arr = np.frombuffer(data, dtype=np.uint8)
-    input_buf = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, size=len(data_arr), hostbuf=data_arr)
-    
-    length_arr = np.array([data_len], dtype=np.uint64)
-    length_buf = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, size=length_arr.nbytes, hostbuf=length_arr)
-    
+
+    # Use bytes directly for hostbuf (no numpy)
+    data_buf = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, size=data_len, hostbuf=data)
+
+    # Length as native unsigned long long
+    import array as _array
+    length_arr = _array.array('Q', [data_len])
+    length_buf = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, size=len(length_arr) * length_arr.itemsize, hostbuf=length_arr)
+
+    # Output buffer as bytearray (no numpy)
     output_buf = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, size=64)
-    
-    prg.sha512(queue, (1,), None, input_buf, output_buf, length_buf)
+
+    prg.sha512(queue, (1,), None, data_buf, output_buf, length_buf)
     queue.finish()
-    
-    result = np.empty(64, dtype=np.uint8)
+
+    result = bytearray(64)
     cl.enqueue_copy(queue, result, output_buf).wait()
     return bytes(result)
 

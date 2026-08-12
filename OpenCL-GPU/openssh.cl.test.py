@@ -75,20 +75,18 @@ def get_device():
 """Run GPU base64_encode kernel and return decoded string."""
 def run_base64(kc, data: bytes):
     """Run base64_encode kernel."""
+    import math
     dev = get_device()
     ctx = cl.Context([dev])
     queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kc).build()
-    import numpy as np
-    import math
     buf = struct.pack("<I", len(data)) + data
-    arr = np.frombuffer(buf, dtype=np.uint8)
-    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=arr)
+    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=buf)
     out_size = (math.ceil(len(data) / 3) * 4) + 1
     bo = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, out_size)
     prg.base64_encode(queue, (1,), None, bi, bo)
     queue.finish()
-    r = np.empty(out_size, dtype=np.uint8)
+    r = bytearray(out_size)
     cl.enqueue_copy(queue, r, bo, is_blocking=True)
     return bytes(r)
 
@@ -99,13 +97,11 @@ def run_build_blob(kc, pub_key: bytes):
     ctx = cl.Context([dev])
     queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kc).build()
-    import numpy as np
-    arr = np.frombuffer(pub_key, dtype=np.uint8)
-    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=arr)
+    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=pub_key)
     bo = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 51)
     prg.build_ssh_public_blob(queue, (1,), None, bi, bo)
     queue.finish()
-    r = np.empty(51, dtype=np.uint8)
+    r = bytearray(51)
     cl.enqueue_copy(queue, r, bo, is_blocking=True)
     return bytes(r)
 
@@ -116,19 +112,16 @@ def run_openkey(kc, seed: bytes, comment: bytes = b""):
     ctx = cl.Context([dev])
     queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kc).build()
-    import numpy as np
-    s = np.frombuffer(seed, dtype=np.uint8)
-    bi_seed = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=s)
+    bi_seed = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=seed)
     cbuf = struct.pack("<I", len(comment)) + comment + b'\x00' * (64 - len(comment))
-    carr = np.frombuffer(cbuf, dtype=np.uint8)
-    bi_comment = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=carr)
+    bi_comment = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=cbuf)
     bo_pubkey = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 32)
     bo_publine = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 256)
     prg.seed_to_ssh_ed25519_pubkey(queue, (1,), None,
                                     bi_seed, bi_comment, bo_pubkey, bo_publine)
     queue.finish()
-    pub_key = np.empty(32, dtype=np.uint8)
-    pub_line = np.empty(256, dtype=np.uint8)
+    pub_key = bytearray(32)
+    pub_line = bytearray(256)
     cl.enqueue_copy(queue, pub_key, bo_pubkey, is_blocking=True)
     cl.enqueue_copy(queue, pub_line, bo_publine, is_blocking=True)
     return bytes(pub_key), bytes(pub_line)
@@ -142,13 +135,11 @@ def run_sha512_32(kc, seed: bytes) -> bytes:
     ctx = cl.Context([dev])
     queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kc).build()
-    import numpy as np
-    s = np.frombuffer(seed, dtype=np.uint8)
-    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=s)
+    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=seed)
     bo = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 64)
     prg.sha512_32(queue, (1,), None, bi, bo)
     queue.finish()
-    r = np.empty(64, dtype=np.uint8)
+    r = bytearray(64)
     cl.enqueue_copy(queue, r, bo, is_blocking=True)
     return bytes(r)
 
@@ -159,13 +150,11 @@ def run_scalar_mult(kc, scalar: bytes) -> bytes:
     ctx = cl.Context([dev])
     queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kc).build()
-    import numpy as np
-    s = np.frombuffer(scalar, dtype=np.uint8)
-    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=s)
+    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=scalar)
     bo = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 96)
     prg.scalar_mult_wrapper(queue, (1,), None, bi, bo)
     queue.finish()
-    r = np.empty(96, dtype=np.uint8)
+    r = bytearray(96)
     cl.enqueue_copy(queue, r, bo, is_blocking=True)
     return bytes(r)
 
@@ -176,13 +165,11 @@ def run_point_to_affine_y(kc, point: bytes) -> bytes:
     ctx = cl.Context([dev])
     queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kc).build()
-    import numpy as np
-    p = np.frombuffer(point, dtype=np.uint8)
-    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=p)
+    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=point)
     bo = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 32)
     prg.point_to_affine_y_wrapper(queue, (1,), None, bi, bo)
     queue.finish()
-    r = np.empty(32, dtype=np.uint8)
+    r = bytearray(32)
     cl.enqueue_copy(queue, r, bo, is_blocking=True)
     return bytes(r)
 
@@ -193,13 +180,11 @@ def run_clamp_and_encode(kc, scalar_in: bytes) -> bytes:
     ctx = cl.Context([dev])
     queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kc).build()
-    import numpy as np
-    s = np.frombuffer(scalar_in, dtype=np.uint8)
-    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=s)
+    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=scalar_in)
     bo = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 32)
     prg.clamp_and_encode(queue, (1,), None, bi, bo)
     queue.finish()
-    r = np.empty(32, dtype=np.uint8)
+    r = bytearray(32)
     cl.enqueue_copy(queue, r, bo, is_blocking=True)
     return bytes(r)
 
@@ -541,17 +526,15 @@ def test_debug(kc):
     ctx = cl.Context([dev])
     queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kc).build()
-    import numpy as np
-    s = np.frombuffer(seed, dtype=np.uint8)
-    bi_seed = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=s)
+    bi_seed = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=seed)
     bo_hash = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 64)
     bo_scalar = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 32)
     bo_pub = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 32)
     prg.debug_pipeline(queue, (1,), None, bi_seed, bo_hash, bo_scalar, bo_pub)
     queue.finish()
-    d_hash = np.empty(64, dtype=np.uint8)
-    d_scalar = np.empty(32, dtype=np.uint8)
-    d_pub = np.empty(32, dtype=np.uint8)
+    d_hash = bytearray(64)
+    d_scalar = bytearray(32)
+    d_pub = bytearray(32)
     cl.enqueue_copy(queue, d_hash, bo_hash, is_blocking=True)
     cl.enqueue_copy(queue, d_scalar, bo_scalar, is_blocking=True)
     cl.enqueue_copy(queue, d_pub, bo_pub, is_blocking=True)

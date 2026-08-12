@@ -2,8 +2,7 @@
 
 """Test suite for ed25519.cl - Ed25519 elliptic curve operations (prepare for openssh ed25519 key generation)"""
 
-import sys, argparse
-import numpy as np
+import sys, argparse, array
 
 try:
     import pyopencl as cl
@@ -16,13 +15,13 @@ D = 3709570593466943934313808350875456518954211387984321901638878553308594028355
 Bx = 15112221349535400772501151409588531511454012693041857206046113283949847762202
 By = 46316835694926478169428394003475163141307993866256225615783033603165251855960
 
-"""Convert integer to 4-element uint64 array (little-endian)."""
+"""Convert integer to 4-element uint32 array (little-endian)."""
 def to_256bit(v):
-    r = np.zeros(8, dtype=np.uint32)
+    r = array.array('I', [0]*8)
     for i in range(8): r[i] = (v >> (32*i)) & 0xFFFFFFFF
     return r
 
-"""Convert 4-element uint64 array to integer (little-endian)."""
+"""Convert 4-element uint32 array to integer (little-endian)."""
 def from_256bit(a):
     r = 0
     for i in range(8): r += int(a[i]) << (32*i)
@@ -47,7 +46,7 @@ def pt_from_bytes(b):
         for i in range(8):
             v = b[base+i*4] | (b[base+i*4+1]<<8) | (b[base+i*4+2]<<16) | (b[base+i*4+3]<<24)
             limb.append(v)
-        coords.append(np.array(limb, dtype=np.uint32))
+        coords.append(array.array('I', limb))
     return tuple(coords)
 
 """Convert projective point (X,Y,Z) to affine (x,y) using Z^(-1) mod p."""
@@ -117,61 +116,57 @@ def get_device():
 def run_add(kc, p1, p2):
     dev = get_device(); ctx = cl.Context([dev]); queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kc).build()
-    a1 = np.frombuffer(p1, dtype=np.uint8); a2 = np.frombuffer(p2, dtype=np.uint8)
-    bi1 = cl.Buffer(ctx, cl.mem_flags.READ_ONLY|cl.mem_flags.COPY_HOST_PTR, hostbuf=a1)
-    bi2 = cl.Buffer(ctx, cl.mem_flags.READ_ONLY|cl.mem_flags.COPY_HOST_PTR, hostbuf=a2)
+    bi1 = cl.Buffer(ctx, cl.mem_flags.READ_ONLY|cl.mem_flags.COPY_HOST_PTR, hostbuf=p1)
+    bi2 = cl.Buffer(ctx, cl.mem_flags.READ_ONLY|cl.mem_flags.COPY_HOST_PTR, hostbuf=p2)
     bo = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 96)
     k = cl.Kernel(prg, "point_add_projective")
     k(queue, (1,), None, bi1, bi2, bo); queue.finish()
-    r = np.empty(96, dtype=np.uint8)
+    r = bytearray(96)
     cl.enqueue_copy(queue, r, bo, is_blocking=True); return r
 
 """Run GPU scalar_mult kernel with 32-byte LE scalar."""
 def run_scalar(kc, scal):
     dev = get_device(); ctx = cl.Context([dev]); queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kc).build()
-    ai = np.frombuffer(scal, dtype=np.uint8)
-    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY|cl.mem_flags.COPY_HOST_PTR, hostbuf=ai)
+    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY|cl.mem_flags.COPY_HOST_PTR, hostbuf=scal)
     bo = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 96)
     k = cl.Kernel(prg, "scalar_mult")
     k(queue, (1,), None, bi, bo); queue.finish()
-    r = np.empty(96, dtype=np.uint8)
+    r = bytearray(96)
     cl.enqueue_copy(queue, r, bo, is_blocking=True); return r
 
 """Run GPU point_init_base kernel to initialize base point B."""
 def run_init(kc):
     dev = get_device(); ctx = cl.Context([dev]); queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kc).build()
-    dm = np.zeros(1, dtype=np.uint8)
+    dm = bytearray(1)
     bd = cl.Buffer(ctx, cl.mem_flags.READ_WRITE|cl.mem_flags.COPY_HOST_PTR, hostbuf=dm)
     bo = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 96)
     k = cl.Kernel(prg, "point_init_base")
     k(queue, (1,), None, bd, bo); queue.finish()
-    r = np.empty(96, dtype=np.uint8)
+    r = bytearray(96)
     cl.enqueue_copy(queue, r, bo, is_blocking=True); return r
 
 """Run GPU point_to_affine_x kernel with 96-byte projective point."""
 def run_aff_x(kc, ptb):
     dev = get_device(); ctx = cl.Context([dev]); queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kc).build()
-    ai = np.frombuffer(ptb, dtype=np.uint8)
-    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY|cl.mem_flags.COPY_HOST_PTR, hostbuf=ai)
+    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY|cl.mem_flags.COPY_HOST_PTR, hostbuf=ptb)
     bo = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 32)
     k = cl.Kernel(prg, "point_to_affine_x")
     k(queue, (1,), None, bi, bo); queue.finish()
-    r = np.empty(32, dtype=np.uint8)
+    r = bytearray(32)
     cl.enqueue_copy(queue, r, bo, is_blocking=True); return r
 
 """Run GPU point_to_affine_y kernel with 96-byte projective point."""
 def run_aff_y(kc, ptb):
     dev = get_device(); ctx = cl.Context([dev]); queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kc).build()
-    ai = np.frombuffer(ptb, dtype=np.uint8)
-    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY|cl.mem_flags.COPY_HOST_PTR, hostbuf=ai)
+    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY|cl.mem_flags.COPY_HOST_PTR, hostbuf=ptb)
     bo = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 32)
     k = cl.Kernel(prg, "point_to_affine_y")
     k(queue, (1,), None, bi, bo); queue.finish()
-    r = np.empty(32, dtype=np.uint8)
+    r = bytearray(32)
     cl.enqueue_copy(queue, r, bo, is_blocking=True); return r
 
 # --- Tests -----------------------------------------------

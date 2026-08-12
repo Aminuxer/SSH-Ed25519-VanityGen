@@ -8,7 +8,7 @@ All points validated via cryptography.hazmat:
 
 import sys
 import argparse
-import numpy as np
+import array
 
 try:
     import pyopencl as cl
@@ -91,9 +91,9 @@ TEST_POINTS = [
 
 # -- Binary helpers (match ed25519.cl I/O) ----------------------
 
-"""Convert integer to 4-element uint64 array (little-endian limbs)."""
+"""Convert integer to 4-element uint32 array (little-endian limbs)."""
 def to_limbs(v):
-    r = np.zeros(8, dtype=np.uint32)
+    r = array.array('I', [0]*8)
     for i in range(8):
         r[i] = (v >> (32 * i)) & 0xFFFFFFFF
     return r
@@ -143,58 +143,53 @@ def get_device():
 
 """Run GPU point_init_base to initialize base point."""
 def run_init(ctx, queue, prg):
-    dm = np.zeros(1, dtype=np.uint8)
+    dm = bytearray(1)
     bd = cl.Buffer(ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, hostbuf=dm)
     bo = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 96)
     cl.Kernel(prg, "point_init_base")(queue, (1,), None, bd, bo)
     queue.finish()
-    r = np.empty(96, dtype=np.uint8)
+    r = bytearray(96)
     cl.enqueue_copy(queue, r, bo, is_blocking=True)
     return bytes(r)
 
 """Run GPU point_add_projective with two projective points."""
 def run_add(ctx, queue, prg, p1, p2):
-    a1 = np.frombuffer(p1, dtype=np.uint8)
-    a2 = np.frombuffer(p2, dtype=np.uint8)
-    bi1 = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=a1)
-    bi2 = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=a2)
+    bi1 = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=p1)
+    bi2 = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=p2)
     bo = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 96)
     cl.Kernel(prg, "point_add_projective")(queue, (1,), None, bi1, bi2, bo)
     queue.finish()
-    r = np.empty(96, dtype=np.uint8)
+    r = bytearray(96)
     cl.enqueue_copy(queue, r, bo, is_blocking=True)
     return bytes(r)
 
 """Run GPU scalar_mult with 32-byte LE scalar."""
 def run_scalar(ctx, queue, prg, scal):
-    ai = np.frombuffer(scal, dtype=np.uint8)
-    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=ai)
+    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=scal)
     bo = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 96)
     cl.Kernel(prg, "scalar_mult")(queue, (1,), None, bi, bo)
     queue.finish()
-    r = np.empty(96, dtype=np.uint8)
+    r = bytearray(96)
     cl.enqueue_copy(queue, r, bo, is_blocking=True)
     return bytes(r)
 
 """Run GPU point_to_affine_x with 96-byte projective point."""
 def run_aff_x(ctx, queue, prg, ptb):
-    ai = np.frombuffer(ptb, dtype=np.uint8)
-    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=ai)
+    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=ptb)
     bo = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 32)
     cl.Kernel(prg, "point_to_affine_x")(queue, (1,), None, bi, bo)
     queue.finish()
-    r = np.empty(32, dtype=np.uint8)
+    r = bytearray(32)
     cl.enqueue_copy(queue, r, bo, is_blocking=True)
     return bytes(r)
 
 """Run GPU point_to_affine_y with 96-byte projective point."""
 def run_aff_y(ctx, queue, prg, ptb):
-    ai = np.frombuffer(ptb, dtype=np.uint8)
-    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=ai)
+    bi = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=ptb)
     bo = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, 32)
     cl.Kernel(prg, "point_to_affine_y")(queue, (1,), None, bi, bo)
     queue.finish()
-    r = np.empty(32, dtype=np.uint8)
+    r = bytearray(32)
     cl.enqueue_copy(queue, r, bo, is_blocking=True)
     return bytes(r)
 

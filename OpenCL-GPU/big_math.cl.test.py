@@ -10,7 +10,8 @@ BYTE ORDER: all byte<->limb conversions use LITTLE-ENDIAN.
 """
 
 import sys, os, random, argparse
-import numpy as np
+import array
+import ctypes
 
 try:
     import pyopencl as cl
@@ -20,14 +21,36 @@ except ImportError as e:
 
 P = 2**255 - 19
 
-"""Convert integer to 4-element uint64 array (little-endian limbs)."""
+# ctypes helpers to replace numpy arrays
+c_uint64_4 = ctypes.c_uint64 * 4
+c_uint8_32 = ctypes.c_uint8 * 32
+
+def py_to_ctypes_ints(lst, n):
+    """Convert Python list of ints to ctypes array of c_uint64."""
+    arr = c_uint64_4(*[ctypes.c_uint64(v) for v in lst])
+    return arr
+
+def py_to_ctypes_bytes(lst):
+    """Convert Python list of ints to ctypes array of c_uint8 (32 bytes)."""
+    arr = c_uint8_32(*[ctypes.c_uint8(v) for v in lst])
+    return arr
+
+def ctypes_to_list(ct_arr):
+    """Convert ctypes array to Python list of ints."""
+    return [int(v) for v in ct_arr]
+
+def bytes_from_ctypes(ct_arr):
+    """Convert ctypes c_uint8 array to bytes."""
+    return bytes(ct_arr)
+
+"""Convert integer to 4-element list of ints (little-endian limbs)."""
 def to_256bit_array(value):
-    result = np.zeros(4, dtype=np.uint64)
+    result = [0, 0, 0, 0]
     for i in range(4):
         result[i] = (value >> (64 * i)) & 0xFFFFFFFFFFFFFFFF
     return result
 
-"""Convert 4-element uint64 array to integer (little-endian limbs)."""
+"""Convert 4-element list of ints to integer (little-endian limbs)."""
 def from_256bit_array(arr):
     result = 0
     for i in range(4):
@@ -48,7 +71,12 @@ def load_kernel():
     with open(kernel_path, "r") as f:
         return f.read(), kernel_path
 
-"""Run a single-input/single-output OpenCL test kernel, return output array."""
+def _buf_size(arr, dtype):
+    """Compute buffer size in bytes for a Python list/array."""
+    itemsize = 8 if dtype == ctypes.c_uint64 else 1
+    return len(arr) * itemsize
+
+"""Run a single-input/single-output OpenCL test kernel, return output list."""
 def run_opencl_test_single_inout(kernel_code, function_name, input_array):
     device = get_opencl_device()
     ctx = cl.Context([device])
@@ -62,10 +90,13 @@ def run_opencl_test_single_inout(kernel_code, function_name, input_array):
             cl_bufs = []
             arrs = []
             for buf, dtype in input_array:
-                arr = np.array(buf, dtype=dtype)
-                arrs.append(arr)
-                cl_buf = cl.Buffer(ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, 
-                                  size=len(arr) * arr.dtype.itemsize, hostbuf=arr)
+                if dtype == ctypes.c_uint64:
+                    ct_arr = py_to_ctypes_ints(buf, 4)
+                else:
+                    ct_arr = py_to_ctypes_bytes(buf)
+                arrs.append(ct_arr)
+                cl_buf = cl.Buffer(ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR,
+                                  size=_buf_size(buf, dtype), hostbuf=ct_arr)
                 cl_bufs.append(cl_buf)
             prg.__getattr__(function_name)(queue, (1,), None, *cl_bufs)
         else:
@@ -74,28 +105,34 @@ def run_opencl_test_single_inout(kernel_code, function_name, input_array):
             arrs = []
             for arr in input_array:
                 arrs.append(arr)
-                cl_buf = cl.Buffer(ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, 
-                                  size=len(arr) * arr.dtype.itemsize, hostbuf=arr)
+                ct_arr = py_to_ctypes_ints(arr, len(arr))
+                cl_buf = cl.Buffer(ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR,
+                                  size=len(arr) * 8, hostbuf=ct_arr)
                 cl_bufs.append(cl_buf)
             prg.__getattr__(function_name)(queue, (1,), None, *cl_bufs)
         queue.finish()
-        # Return the last buffer (the output)
-        result = np.empty(len(arrs[-1]), dtype=arrs[-1].dtype)
-        cl.enqueue_copy(queue, result, cl_bufs[-1], is_blocking=True)
-        return result
+        # Read back the last buffer into a Python list
+        result_arr = c_uint64_4()
+        cl.enqueue_copy(queue, result_arr, cl_bufs[-1], is_blocking=True)
+        return ctypes_to_list(result_arr)
     else:
         # Handle tuple (array, dtype)
         if isinstance(input_array, tuple):
-            arr = np.array(input_array[0], dtype=input_array[1])
+            lst, dtype = input_array[0], input_array[1]
         else:
-            arr = input_array.copy()
-        cl_buf = cl.Buffer(ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, 
-                          size=len(arr) * arr.dtype.itemsize, hostbuf=arr)
+            lst = list(input_array)
+            dtype = ctypes.c_uint64
+        if dtype == ctypes.c_uint64:
+            ct_arr = py_to_ctypes_ints(lst, 4)
+        else:
+            ct_arr = py_to_ctypes_bytes(lst)
+        cl_buf = cl.Buffer(ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR,
+                          size=len(lst) * (8 if dtype == ctypes.c_uint64 else 1), hostbuf=ct_arr)
         prg.__getattr__(function_name)(queue, (1,), None, cl_buf)
         queue.finish()
-        result = np.empty(len(arr), dtype=arr.dtype)
-        cl.enqueue_copy(queue, result, cl_buf, is_blocking=True)
-        return result
+        result_arr = c_uint64_4()
+        cl.enqueue_copy(queue, result_arr, cl_buf, is_blocking=True)
+        return ctypes_to_list(result_arr)
 
 """Run an OpenCL test kernel with one input and one output buffer."""
 def run_opencl_test_two_out(kernel_code, function_name, input_buffer, output_buffer, output_mode=cl.mem_flags.WRITE_ONLY):
@@ -104,28 +141,52 @@ def run_opencl_test_two_out(kernel_code, function_name, input_buffer, output_buf
     ctx = cl.Context([device])
     queue = cl.CommandQueue(ctx)
     prg = cl.Program(ctx, kernel_code).build()
-    
+
     # Input buffer
     if isinstance(input_buffer, tuple):
-        arr = np.frombuffer(input_buffer[0], dtype=input_buffer[1]) if isinstance(input_buffer[0], bytes) else np.array(input_buffer[0], dtype=input_buffer[1])
+        inp_data, inp_dtype = input_buffer[0], input_buffer[1]
     else:
-        arr = np.array(input_buffer, dtype=np.uint64)
-    cl_input = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, 
-                        size=len(arr) * arr.dtype.itemsize, hostbuf=arr)
-    
+        inp_data, inp_dtype = input_buffer, ctypes.c_uint64
+    if inp_dtype == ctypes.c_uint64:
+        inp_ct = py_to_ctypes_ints(inp_data, 4)
+        inp_size = len(inp_data) * 8
+    else:
+        inp_ct = py_to_ctypes_bytes(inp_data)
+        inp_size = len(inp_data)
+    cl_input = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, inp_size, hostbuf=inp_ct)
+
     # Output buffer
     if isinstance(output_buffer, tuple):
-        arr_out = np.frombuffer(output_buffer[0], dtype=output_buffer[1]) if isinstance(output_buffer[0], bytes) else np.array(output_buffer[0], dtype=output_buffer[1])
+        out_data, out_dtype = output_buffer[0], output_buffer[1]
     else:
-        arr_out = np.array(output_buffer, dtype=np.uint64)
-    # Always initialize output buffer to zeros (needed for | operations in kernels)
-    cl_output = cl.Buffer(ctx, cl.mem_flags.READ_WRITE | cl.mem_flags.COPY_HOST_PTR, len(arr_out) * arr_out.dtype.itemsize, hostbuf=arr_out)
-    
+        out_data, out_dtype = output_buffer, ctypes.c_uint64
+    if out_dtype == ctypes.c_uint64:
+        out_size = len(out_data) * 8
+    else:
+        out_size = len(out_data)
+
+    if output_mode == cl.mem_flags.WRITE_ONLY:
+        cl_output = cl.Buffer(ctx, output_mode, out_size)
+    elif output_mode == cl.mem_flags.READ_WRITE:
+        out_ct = py_to_ctypes_ints(out_data, 4) if out_dtype == ctypes.c_uint64 else py_to_ctypes_bytes(out_data)
+        cl_output = cl.Buffer(ctx, output_mode | cl.mem_flags.COPY_HOST_PTR, out_size, hostbuf=out_ct)
+    else:
+        cl_output = cl.Buffer(ctx, output_mode, out_size)
+
     prg.__getattr__(function_name)(queue, (1,), None, cl_input, cl_output)
     queue.finish()
-    result = np.empty(len(arr_out), dtype=arr_out.dtype)
-    cl.enqueue_copy(queue, result, cl_output).wait()
-    return result
+
+    # Read back result
+    if out_dtype == ctypes.c_uint64:
+        result_arr = c_uint64_4()
+    else:
+        result_arr = c_uint8_32()
+    cl.enqueue_copy(queue, result_arr, cl_output).wait()
+
+    if out_dtype == ctypes.c_uint64:
+        return ctypes_to_list(result_arr)
+    else:
+        return ctypes_to_list(result_arr)
 
 
 """Run an OpenCL test kernel with multiple input buffers and one output buffer."""
@@ -143,56 +204,54 @@ def run_opencl_test(kernel_code, function_name, input_buffers, output_size, buff
     cl_bufs = []
     for i, buf in enumerate(input_buffers):
         if isinstance(buf, tuple):
-            arr = np.array(buf[0], dtype=buf[1])
+            data, dtype = buf[0], buf[1]
         else:
-            arr = np.array(buf, dtype=np.uint64)
+            data, dtype = buf, ctypes.c_uint64
+        if dtype == ctypes.c_uint64:
+            ct_arr = py_to_ctypes_ints(data, 4)
+            bufsz = len(data) * 8
+        else:
+            ct_arr = py_to_ctypes_bytes(data)
+            bufsz = len(data)
         # Determine buffer mode
         if buffer_modes and i < len(buffer_modes):
             mode = buffer_modes[i]
         else:
             mode = cl.mem_flags.READ_ONLY
         if mode == cl.mem_flags.WRITE_ONLY:
-            # WRITE_ONLY buffer cannot be initialized with hostbuf
-            cl_buf = cl.Buffer(ctx, mode, size=len(arr) * arr.dtype.itemsize)
+            cl_buf = cl.Buffer(ctx, mode, size=bufsz)
         else:
-            # READ_ONLY buffer can be initialized with hostbuf
-            cl_buf = cl.Buffer(ctx, mode | cl.mem_flags.COPY_HOST_PTR, 
-                             size=len(arr) * arr.dtype.itemsize, hostbuf=arr)
+            cl_buf = cl.Buffer(ctx, mode | cl.mem_flags.COPY_HOST_PTR, bufsz, hostbuf=ct_arr)
         cl_bufs.append(cl_buf)
-    # Determine output buffer mode (default WRITE_ONLY)
-    if output_mode == cl.mem_flags.WRITE_ONLY:
-        # For WRITE_ONLY, don't initialize with hostbuf
-        cl_output = cl.Buffer(ctx, output_mode, output_size)
-    else:
-        # For other modes, initialize with zeros or None
-        cl_output = cl.Buffer(ctx, output_mode, output_size)
-    cl_bufs.append(cl_output)  # Add output buffer to the list
+    # Output buffer
+    cl_output = cl.Buffer(ctx, output_mode, output_size)
+    cl_bufs.append(cl_output)
     args = cl_bufs
     prg.__getattr__(function_name)(queue, (1,), None, *args)
     queue.finish()
-    result = np.empty(output_size // np.dtype(np.uint64).itemsize, dtype=np.uint64)
-    cl.enqueue_copy(queue, result, cl_output).wait()
-    return result
+    result_arr = c_uint64_4()
+    cl.enqueue_copy(queue, result_arr, cl_output).wait()
+    return ctypes_to_list(result_arr)
 
 """CPU reference: add two 256-bit values mod 2^256, limb by limb."""
 def numpy_add_256(a, b):
-    result = np.zeros(4, dtype=np.uint64)
+    result = [0, 0, 0, 0]
     carry = 0
     for i in range(4):
         s = int(a[i]) + int(b[i]) + carry
         result[i] = s & 0xFFFFFFFFFFFFFFFF
         carry = s >> 64
-    return result.astype(np.uint64)
+    return result
 
 """CPU reference: subtract two 256-bit values mod 2^256, limb by limb."""
 def numpy_sub_256(a, b):
-    result = np.zeros(4, dtype=np.uint64)
+    result = [0, 0, 0, 0]
     borrow = 0
     for i in range(4):
         d = int(a[i]) - int(b[i]) - borrow
         result[i] = d & 0xFFFFFFFFFFFFFFFF
         borrow = 1 if d < 0 else 0
-    return result.astype(np.uint64)
+    return result
 
 """CPU reference: reduce x mod p = 2^255 - 19 using Python pow."""
 def numpy_mod_p_reduce(x):
@@ -218,31 +277,29 @@ def numpy_mod_p_inverse(a):
 
 """CPU reference: convert 32-byte LE seed to 4x64-bit scalar."""
 def numpy_seed_to_scalar(seed):
-    result = np.zeros(4, dtype=np.uint64)
+    result = [0, 0, 0, 0]
     for i in range(32):
         result[i // 8] |= (seed[i] << ((i % 8) * 8))
     return result
 
-"""CPU reference: convert 4x64-bit scalar to 32-byte LE array."""
+"""CPU reference: convert 4x64-bit scalar to 32-byte LE list."""
 def numpy_scalar_to_bytes(scalar):
-    """numpy reference: scalar_to_bytes -- LITTLE-ENDIAN byte order.
-    limb[0] (LSB) -> bytes[0..3], limb[7] (MSB) -> bytes[28..31]"""
-    result = bytearray()
+    """CPU reference: scalar_to_bytes -- LITTLE-ENDIAN byte order.
+    limb[0] (LSB) -> bytes[0..3], limb[3] (MSB) -> bytes[24..31]"""
+    result = []
     for i in range(4):
-        result.extend(bytes([
-            (scalar[i] >>  0) & 0xFF,
-            (scalar[i] >>  8) & 0xFF,
-            (scalar[i] >> 16) & 0xFF,
-            (scalar[i] >> 24) & 0xFF,
-        ]))
-    return bytes(result)
+        result.append((scalar[i] >>  0) & 0xFF)
+        result.append((scalar[i] >>  8) & 0xFF)
+        result.append((scalar[i] >> 16) & 0xFF)
+        result.append((scalar[i] >> 24) & 0xFF)
+    return result
 
 """Test GPU add_256 against CPU reference for random inputs."""
 def test_add_256(kernel_code):
     print("Testing add_256...")
     test_cases = [
-        ("0 + 0", np.zeros(4, dtype=np.uint64), np.zeros(4, dtype=np.uint64)),
-        ("0 + 1", np.zeros(4, dtype=np.uint64), to_256bit_array(1)),
+        ("0 + 0", [0, 0, 0, 0], [0, 0, 0, 0]),
+        ("0 + 1", [0, 0, 0, 0], to_256bit_array(1)),
         ("1 + 1", to_256bit_array(1), to_256bit_array(1)),
         ("2^255 + 1", to_256bit_array(2**255), to_256bit_array(1)),
         ("2^256 - 1 + 1", to_256bit_array(2**256 - 1), to_256bit_array(1)),
@@ -257,8 +314,8 @@ def test_add_256(kernel_code):
     all_passed = True
     for name, a, b in test_cases:
         expected = numpy_add_256(a, b)
-        result = run_opencl_test(kernel_code, "add_256", [(a, np.uint64), (b, np.uint64)], 32, [cl.mem_flags.READ_ONLY, cl.mem_flags.READ_ONLY, cl.mem_flags.WRITE_ONLY])
-        if np.array_equal(result, expected):
+        result = run_opencl_test(kernel_code, "add_256", [(a, ctypes.c_uint64), (b, ctypes.c_uint64)], 32, [cl.mem_flags.READ_ONLY, cl.mem_flags.READ_ONLY, cl.mem_flags.WRITE_ONLY])
+        if result == expected:
             print(f"  PASS: {name} {result}")
         else:
             print(f"  FAIL: {name}")
@@ -270,20 +327,15 @@ def test_add_256(kernel_code):
 """Test GPU sub_256 against CPU reference for random inputs."""
 def test_sub_256(kernel_code):
     print("Testing sub_256...")
-    # Test cases: zeros, ones, boundary values, and random pairs
     test_cases = [
-        # Zero cases
-        ("0 - 0", np.zeros(4, dtype=np.uint64), np.zeros(4, dtype=np.uint64)),
-        ("1 - 0", to_256bit_array(1), np.zeros(4, dtype=np.uint64)),
-        ("0 - 1", np.zeros(4, dtype=np.uint64), to_256bit_array(1)),
-        # One cases
+        ("0 - 0", [0, 0, 0, 0], [0, 0, 0, 0]),
+        ("1 - 0", to_256bit_array(1), [0, 0, 0, 0]),
+        ("0 - 1", [0, 0, 0, 0], to_256bit_array(1)),
         ("1 - 1", to_256bit_array(1), to_256bit_array(1)),
         ("2 - 1", to_256bit_array(2), to_256bit_array(1)),
-        # Boundary cases
         ("2^255 - 2^255", to_256bit_array(2**255), to_256bit_array(2**255)),
         ("2^256-1 - 1", to_256bit_array(2**256 - 1), to_256bit_array(1)),
         ("2^256-1 - (2^256-1)", to_256bit_array(2**256 - 1), to_256bit_array(2**256 - 1)),
-        # Random pairs
         ("123456789 - 987654321", to_256bit_array(123456789), to_256bit_array(987654321)),
         ("111111111 - 222222222", to_256bit_array(111111111), to_256bit_array(222222222)),
         ("999999999 - 111111111", to_256bit_array(999999999), to_256bit_array(111111111)),
@@ -293,8 +345,8 @@ def test_sub_256(kernel_code):
     all_passed = True
     for name, a, b in test_cases:
         expected = numpy_sub_256(a, b)
-        result = run_opencl_test(kernel_code, "sub_256", [(a, np.uint64), (b, np.uint64)], 32, [cl.mem_flags.READ_ONLY, cl.mem_flags.READ_ONLY, cl.mem_flags.WRITE_ONLY])
-        if np.array_equal(result, expected):
+        result = run_opencl_test(kernel_code, "sub_256", [(a, ctypes.c_uint64), (b, ctypes.c_uint64)], 32, [cl.mem_flags.READ_ONLY, cl.mem_flags.READ_ONLY, cl.mem_flags.WRITE_ONLY])
+        if result == expected:
             print(f"  PASS: {name} {result}")
         else:
             print(f"  FAIL: {name}")
@@ -305,9 +357,8 @@ def test_sub_256(kernel_code):
 """Test GPU copy_256 copies all 4 limbs correctly."""
 def test_copy_256(kernel_code):
     print("Testing copy_256...")
-    # Test cases: zeros, ones, boundary values, and random values
     test_cases = [
-        ("copy zeros", np.zeros(4, dtype=np.uint64)),
+        ("copy zeros", [0, 0, 0, 0]),
         ("copy ones", to_256bit_array(1)),
         ("copy 2^255", to_256bit_array(2**255)),
         ("copy 2^256-1", to_256bit_array(2**256 - 1)),
@@ -324,10 +375,9 @@ def test_copy_256(kernel_code):
     ]
     all_passed = True
     for name, src in test_cases:
-        # For copy_256(src, dst), we pass list of (array, dtype) tuples
-        dst = np.zeros(4, dtype=np.uint64)
-        result = run_opencl_test_two_out(kernel_code, "copy_256", (src, np.uint64), (dst, np.uint64), cl.mem_flags.READ_WRITE)
-        if np.array_equal(result, src):
+        dst = [0, 0, 0, 0]
+        result = run_opencl_test_two_out(kernel_code, "copy_256", (src, ctypes.c_uint64), (dst, ctypes.c_uint64), cl.mem_flags.READ_WRITE)
+        if result == src:
             print(f"  PASS: {name} {result}")
         else:
             print(f"  FAIL: {name}")
@@ -348,9 +398,9 @@ def test_one_256(kernel_code):
     all_passed = True
     expected = to_256bit_array(1)
     for name in test_cases:
-        result = np.zeros(4, dtype=np.uint64)
-        result = run_opencl_test_single_inout(kernel_code, "one_256", (result, np.uint64))
-        if np.array_equal(result, expected):
+        result = [0, 0, 0, 0]
+        result = run_opencl_test_single_inout(kernel_code, "one_256", (result, ctypes.c_uint64))
+        if result == expected:
             print(f"  PASS: {name} {result}")
         else:
             print(f"  FAIL: {name}")
@@ -358,7 +408,6 @@ def test_one_256(kernel_code):
             print(f"    Got:      {result}")
             all_passed = False
     return all_passed
-"""Test GPU zero_256 sets value to [0, 0, 0, 0]."""
 def test_zero_256(kernel_code):
     print("Testing zero_256...")
     test_cases = [
@@ -369,11 +418,11 @@ def test_zero_256(kernel_code):
         "zero_256 test 5",
     ]
     all_passed = True
-    expected = np.zeros(4, dtype=np.uint64)
+    expected = [0, 0, 0, 0]
     for name in test_cases:
-        result = np.zeros(4, dtype=np.uint64)
-        result = run_opencl_test_single_inout(kernel_code, "zero_256", (result, np.uint64))
-        if np.array_equal(result, expected):
+        result = [0, 0, 0, 0]
+        result = run_opencl_test_single_inout(kernel_code, "zero_256", (result, ctypes.c_uint64))
+        if result == expected:
             print(f"  PASS: {name} {result}")
         else:
             print(f"  FAIL: {name}")
@@ -384,8 +433,6 @@ def test_zero_256(kernel_code):
 """Test GPU mod_p_reduce against Python mod p reference."""
 def test_mod_p_reduce(kernel_code):
     print("Testing mod_p_reduce...")
-    P = 2**255 - 19
-    
     test_cases = [
         ("0", to_256bit_array(0)),
         ("1", to_256bit_array(1)),
@@ -407,16 +454,13 @@ def test_mod_p_reduce(kernel_code):
         ("2^256-1", to_256bit_array(2**256 - 1)),
         ("10*P + 500", to_256bit_array(10 * P + 500)),
     ]
-    
+
     all_passed = True
     for name, input_val in test_cases:
-        # Compute expected using Python reference implementation
         expected = numpy_mod_p_reduce(input_val)
-        
-        result = np.zeros(4, dtype=np.uint64)
-        result = run_opencl_test_single_inout(kernel_code, "mod_p_reduce", (input_val, np.uint64))
-        
-        if np.array_equal(result, expected):
+        result = [0, 0, 0, 0]
+        result = run_opencl_test_single_inout(kernel_code, "mod_p_reduce", (input_val, ctypes.c_uint64))
+        if result == expected:
             print(f"  PASS: {name} {result}")
         else:
             print(f"  FAIL: {name}")
@@ -427,11 +471,9 @@ def test_mod_p_reduce(kernel_code):
 """Test GPU mul_mod_p against Python (a*b) mod p reference."""
 def test_mul_mod_p(kernel_code):
     print("Testing mul_mod_p...")
-    P = 2**255 - 19
-    
     test_cases = [
-        ("0 * anything", np.zeros(4, dtype=np.uint64), to_256bit_array(12345)),
-        ("anything * 0", to_256bit_array(12345), np.zeros(4, dtype=np.uint64)),
+        ("0 * anything", [0, 0, 0, 0], to_256bit_array(12345)),
+        ("anything * 0", to_256bit_array(12345), [0, 0, 0, 0]),
         ("1 * 1", to_256bit_array(1), to_256bit_array(1)),
         ("1 * p-1", to_256bit_array(1), to_256bit_array(P - 1)),
         ("2 * 2", to_256bit_array(2), to_256bit_array(2)),
@@ -445,8 +487,8 @@ def test_mul_mod_p(kernel_code):
     all_passed = True
     for name, a, b in test_cases:
         expected = numpy_mul_mod_p(a, b)
-        result = run_opencl_test(kernel_code, "mul_mod_p", [(a, np.uint64), (b, np.uint64)], 32, [cl.mem_flags.READ_ONLY, cl.mem_flags.READ_ONLY, cl.mem_flags.WRITE_ONLY])
-        if np.array_equal(result, expected):
+        result = run_opencl_test(kernel_code, "mul_mod_p", [(a, ctypes.c_uint64), (b, ctypes.c_uint64)], 32, [cl.mem_flags.READ_ONLY, cl.mem_flags.READ_ONLY, cl.mem_flags.WRITE_ONLY])
+        if result == expected:
             print(f"  PASS: {name} {result}")
         else:
             print(f"  FAIL: {name}")
@@ -458,7 +500,7 @@ def test_mul_mod_p(kernel_code):
 def test_mod_p_inverse(kernel_code):
     print("Testing mod_p_inverse...")
     P = 2**255 - 19
-    
+
     test_cases = [
         ("inverse of 1", to_256bit_array(1), to_256bit_array(1)),
         ("inverse of (p-1)", to_256bit_array(P - 1), to_256bit_array(P - 1)),
@@ -471,8 +513,9 @@ def test_mod_p_inverse(kernel_code):
     all_passed = True
     for name, a, _ in test_cases:
         expected = numpy_mod_p_inverse(a)
-        result = run_opencl_test_two_out(kernel_code, "mod_p_inverse", (a, np.uint64), (np.zeros(4, dtype=np.uint64), np.uint64))
-        if np.array_equal(result, expected):
+        dst = ctypes.c_uint64 * 4
+        result = run_opencl_test_two_out(kernel_code, "mod_p_inverse", (a, ctypes.c_uint64), (dst(0, 0, 0, 0), ctypes.c_uint64))
+        if result == expected:
             print(f"  PASS: {name} {result}")
         else:
             print(f"  FAIL: {name}")
@@ -482,10 +525,11 @@ def test_mod_p_inverse(kernel_code):
     # Additional test: verify a * a^(-1) = 1
     if all_passed:
         for i, (name, a, _) in enumerate(test_cases[2:7], 2):
-            inv = run_opencl_test_two_out(kernel_code, "mod_p_inverse", (a, np.uint64), (np.zeros(4, dtype=np.uint64), np.uint64))
-            product = run_opencl_test(kernel_code, "mul_mod_p", [(a, np.uint64), (inv, np.uint64)], 32)
+            dst = ctypes.c_uint64 * 4
+            inv = run_opencl_test_two_out(kernel_code, "mod_p_inverse", (a, ctypes.c_uint64), (dst(0, 0, 0, 0), ctypes.c_uint64))
+            product = run_opencl_test(kernel_code, "mul_mod_p", [(a, ctypes.c_uint64), (inv, ctypes.c_uint64)], 32)
             expected_one = to_256bit_array(1)
-            if np.array_equal(product, expected_one):
+            if product == expected_one:
                 print(f"  PASS: a * a^(-1) = 1 for test {i}")
             else:
                 print(f"  FAIL: a * a^(-1) = 1 for test {i}")
@@ -508,17 +552,19 @@ def test_seed_to_scalar(kernel_code):
     ]
     all_passed = True
     for name, seed_bytes in test_cases:
-        scalar = np.zeros(4, dtype=np.uint64)
-        scalar = run_opencl_test_two_out(kernel_code, "seed_to_scalar", (seed_bytes, np.uint8), (scalar, np.uint64))
-        expected = np.zeros(4, dtype=np.uint64)
+        scalar_ctypes = ctypes.c_uint64 * 4
+        scalar = scalar_ctypes(0, 0, 0, 0)
+        scalar = run_opencl_test_two_out(kernel_code, "seed_to_scalar", (seed_bytes, ctypes.c_uint8), (scalar, ctypes.c_uint64))
+        expected = [0, 0, 0, 0]
         for i in range(32):
-            expected[i//8] |= (seed_bytes[i] << ((i % 8) * 8))
-        if np.array_equal(scalar, expected):
-            print(f"  PASS: {name} {scalar}")
+            expected[i // 8] |= (seed_bytes[i] << ((i % 8) * 8))
+        result_list = ctypes_to_list(scalar)
+        if result_list == expected:
+            print(f"  PASS: {name} {result_list}")
         else:
             print(f"  FAIL: {name}")
             print(f"    Expected: {expected}")
-            print(f"    Got:      {scalar}")
+            print(f"    Got:      {result_list}")
             all_passed = False
     return all_passed
 """Test GPU scalar_to_bytes against CPU limb-to-byte conversion."""
@@ -533,21 +579,23 @@ def test_scalar_to_bytes(kernel_code):
     ]
     all_passed = True
     for name, scalar in test_cases:
-        bytes_out = np.zeros(32, dtype=np.uint8)
-        result = run_opencl_test_two_out(kernel_code, "scalar_to_bytes", (scalar, np.uint64), (bytes_out, np.uint8))
+        bytes_out = bytes([0] * 32)
+        result = run_opencl_test_two_out(kernel_code, "scalar_to_bytes", (scalar, ctypes.c_uint64), (bytes_out, ctypes.c_uint8))
         # Expected: LITTLE-ENDIAN byte order (consistent with seed_to_scalar)
-        expected = np.zeros(32, dtype=np.uint8)
+        expected = [0] * 32
         for i in range(4):
             expected[i*8 + 0] = (scalar[i] >>  0) & 0xFF
             expected[i*8 + 1] = (scalar[i] >>  8) & 0xFF
             expected[i*8 + 2] = (scalar[i] >> 16) & 0xFF
             expected[i*8 + 3] = (scalar[i] >> 24) & 0xFF
-        if np.array_equal(result, expected):
-            print(f"  PASS: {name} {result}")
+        result_bytes = bytes(result)
+        expected_bytes = bytes(expected)
+        if result_bytes == expected_bytes:
+            print(f"  PASS: {name} {result_bytes.hex()}")
         else:
             print(f"  FAIL: {name}")
-            print(f"    Expected: {expected.tobytes().hex()}")
-            print(f"    Got:      {result.tobytes().hex()}")
+            print(f"    Expected: {expected_bytes.hex()}")
+            print(f"    Got:      {result_bytes.hex()}")
             all_passed = False
     return all_passed
 """Entry point: parse args, run selected tests, report results."""
@@ -585,16 +633,16 @@ def main():
         if args.func == "all":
             print("ERROR: --func all cannot be used with --a/--b parameters")
             sys.exit(1)
-        
+
         if args.func == "add":
             # Test add_256 with custom a and b
             print(f"Testing add_256: {a_val} + {b_val}")
             a_arr = to_256bit_array(a_val)
             b_arr = to_256bit_array(b_val)
             expected = numpy_add_256(a_arr, b_arr)
-            result = run_opencl_test(kernel_code, "add_256", [(a_arr, np.uint64), (b_arr, np.uint64)], 32, 
+            result = run_opencl_test(kernel_code, "add_256", [(a_arr, ctypes.c_uint64), (b_arr, ctypes.c_uint64)], 32,
                                     [cl.mem_flags.READ_ONLY, cl.mem_flags.READ_ONLY, cl.mem_flags.WRITE_ONLY])
-            if np.array_equal(result, expected):
+            if result == expected:
                 print(f"  PASS")
                 print(f"    Result: {from_256bit_array(result)}")
             else:
@@ -608,9 +656,9 @@ def main():
             a_arr = to_256bit_array(a_val)
             b_arr = to_256bit_array(b_val)
             expected = numpy_sub_256(a_arr, b_arr)
-            result = run_opencl_test(kernel_code, "sub_256", [(a_arr, np.uint64), (b_arr, np.uint64)], 32, 
+            result = run_opencl_test(kernel_code, "sub_256", [(a_arr, ctypes.c_uint64), (b_arr, ctypes.c_uint64)], 32,
                                     [cl.mem_flags.READ_ONLY, cl.mem_flags.READ_ONLY, cl.mem_flags.WRITE_ONLY])
-            if np.array_equal(result, expected):
+            if result == expected:
                 print(f"  PASS")
                 print(f"    Result: {from_256bit_array(result)}")
             else:
@@ -622,10 +670,10 @@ def main():
             # Test copy_256 with custom a
             print(f"Testing copy_256: copy {a_val}")
             a_arr = to_256bit_array(a_val)
-            dst = np.zeros(4, dtype=np.uint64)
-            expected = a_arr.copy()
-            result = run_opencl_test_two_out(kernel_code, "copy_256", (a_arr, np.uint64), (dst, np.uint64), cl.mem_flags.READ_WRITE)
-            if np.array_equal(result, expected):
+            dst = ctypes.c_uint64 * 4
+            expected = list(a_arr)
+            result = run_opencl_test_two_out(kernel_code, "copy_256", (a_arr, ctypes.c_uint64), (dst(0, 0, 0, 0), ctypes.c_uint64), cl.mem_flags.READ_WRITE)
+            if result == expected:
                 print(f"  PASS")
                 print(f"    Result: {from_256bit_array(result)}")
             else:
@@ -636,10 +684,11 @@ def main():
         elif args.func == "one":
             # Test one_256 (no parameters needed)
             print("Testing one_256")
-            result = np.zeros(4, dtype=np.uint64)
+            result_ctypes = ctypes.c_uint64 * 4
+            result = result_ctypes(0, 0, 0, 0)
             expected = to_256bit_array(1)
-            result = run_opencl_test_single_inout(kernel_code, "one_256", (result, np.uint64))
-            if np.array_equal(result, expected):
+            result = run_opencl_test_single_inout(kernel_code, "one_256", (result, ctypes.c_uint64))
+            if result == expected:
                 print(f"  PASS")
                 print(f"    Result: {from_256bit_array(result)}")
             else:
@@ -650,10 +699,11 @@ def main():
         elif args.func == "zero":
             # Test zero_256 (no parameters needed)
             print("Testing zero_256")
-            result = np.zeros(4, dtype=np.uint64)
-            expected = np.zeros(4, dtype=np.uint64)
-            result = run_opencl_test_single_inout(kernel_code, "zero_256", (result, np.uint64))
-            if np.array_equal(result, expected):
+            result_ctypes = ctypes.c_uint64 * 4
+            result = result_ctypes(0, 0, 0, 0)
+            expected = [0, 0, 0, 0]
+            result = run_opencl_test_single_inout(kernel_code, "zero_256", (result, ctypes.c_uint64))
+            if result == expected:
                 print(f"  PASS")
                 print(f"    Result: {from_256bit_array(result)}")
             else:
@@ -666,9 +716,10 @@ def main():
             print(f"Testing mod_p_reduce: {a_val} mod (2^255 - 19)")
             a_arr = to_256bit_array(a_val)
             expected = numpy_mod_p_reduce(a_arr)
-            result = np.zeros(4, dtype=np.uint64)
-            result = run_opencl_test_single_inout(kernel_code, "mod_p_reduce", (a_arr, np.uint64))
-            if np.array_equal(result, expected):
+            result_ctypes = ctypes.c_uint64 * 4
+            result = result_ctypes(0, 0, 0, 0)
+            result = run_opencl_test_single_inout(kernel_code, "mod_p_reduce", (a_arr, ctypes.c_uint64))
+            if result == expected:
                 print(f"  PASS")
                 print(f"    Result: {from_256bit_array(result)}")
             else:
@@ -682,9 +733,9 @@ def main():
             a_arr = to_256bit_array(a_val)
             b_arr = to_256bit_array(b_val)
             expected = numpy_mul_mod_p(a_arr, b_arr)
-            result = run_opencl_test(kernel_code, "mul_mod_p", [(a_arr, np.uint64), (b_arr, np.uint64)], 32, 
+            result = run_opencl_test(kernel_code, "mul_mod_p", [(a_arr, ctypes.c_uint64), (b_arr, ctypes.c_uint64)], 32,
                                     [cl.mem_flags.READ_ONLY, cl.mem_flags.READ_ONLY, cl.mem_flags.WRITE_ONLY])
-            if np.array_equal(result, expected):
+            if result == expected:
                 print(f"  PASS")
                 print(f"    Result: {from_256bit_array(result)}")
             else:
@@ -697,9 +748,10 @@ def main():
             print(f"Testing mod_p_inverse: {a_val}^(-1) mod (2^255 - 19)")
             a_arr = to_256bit_array(a_val)
             expected = numpy_mod_p_inverse(a_arr)
-            result = np.zeros(4, dtype=np.uint64)
-            result = run_opencl_test_two_out(kernel_code, "mod_p_inverse", (a_arr, np.uint64), (result, np.uint64))
-            if np.array_equal(result, expected):
+            result_ctypes = ctypes.c_uint64 * 4
+            result = result_ctypes(0, 0, 0, 0)
+            result = run_opencl_test_two_out(kernel_code, "mod_p_inverse", (a_arr, ctypes.c_uint64), (result, ctypes.c_uint64))
+            if result == expected:
                 print(f"  PASS")
                 print(f"    Result: {from_256bit_array(result)}")
             else:
@@ -715,31 +767,34 @@ def main():
                 seed_bytes = bytes([i % 256 for i in range(32)])
             else:
                 seed_bytes = bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32])
-            scalar = np.zeros(4, dtype=np.uint64)
+            scalar_ctypes = ctypes.c_uint64 * 4
+            scalar = scalar_ctypes(0, 0, 0, 0)
             expected = numpy_seed_to_scalar(seed_bytes)
-            scalar = run_opencl_test_two_out(kernel_code, "seed_to_scalar", (seed_bytes, np.uint8), (scalar, np.uint64))
-            if np.array_equal(scalar, expected):
+            scalar = run_opencl_test_two_out(kernel_code, "seed_to_scalar", (seed_bytes, ctypes.c_uint8), (scalar, ctypes.c_uint64))
+            if ctypes_to_list(scalar) == expected:
                 print(f"  PASS")
-                print(f"    Result: {from_256bit_array(scalar)}")
+                print(f"    Result: {from_256bit_array(ctypes_to_list(scalar))}")
             else:
                 print(f"  FAIL")
                 print(f"    Expected: {from_256bit_array(expected)}")
-                print(f"    Got:      {from_256bit_array(scalar)}")
+                print(f"    Got:      {from_256bit_array(ctypes_to_list(scalar))}")
                 sys.exit(1)
         elif args.func == "scalar":
             # Test scalar_to_bytes with custom a
             print(f"Testing scalar_to_bytes: {a_val}")
             a_arr = to_256bit_array(a_val)
-            bytes_out = np.zeros(32, dtype=np.uint8)
+            bytes_out = bytes([0] * 32)
             expected = numpy_scalar_to_bytes(a_arr)
-            result = run_opencl_test_two_out(kernel_code, "scalar_to_bytes", (a_arr, np.uint64), (bytes_out, np.uint8))
-            if np.array_equal(result, expected):
+            result = run_opencl_test_two_out(kernel_code, "scalar_to_bytes", (a_arr, ctypes.c_uint64), (bytes_out, ctypes.c_uint8))
+            result_bytes = bytes(result)
+            expected_bytes = bytes(expected)
+            if result_bytes == expected_bytes:
                 print(f"  PASS")
-                print(f"    Result: {result.tobytes().hex()}")
+                print(f"    Result: {result_bytes.hex()}")
             else:
                 print(f"  FAIL")
-                print(f"    Expected: {expected.hex()}")
-                print(f"    Got:      {result.tobytes().hex()}")
+                print(f"    Expected: {expected_bytes.hex()}")
+                print(f"    Got:      {result_bytes.hex()}")
                 sys.exit(1)
     else:
         # Original test mode - run all tests as before

@@ -42,7 +42,7 @@ def sha512_opencl(data):
     queue = cl.CommandQueue(ctx, properties=cl.command_queue_properties.PROFILING_ENABLE)
     prg = cl.Program(ctx, cl_content).build()
 
-    # Use bytes directly for hostbuf (no numpy)
+    # Use bytes directly for hostbuf
     data_buf = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, size=data_len, hostbuf=data)
 
     # Length as native unsigned long long
@@ -50,7 +50,7 @@ def sha512_opencl(data):
     length_arr = _array.array('Q', [data_len])
     length_buf = cl.Buffer(ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, size=len(length_arr) * length_arr.itemsize, hostbuf=length_arr)
 
-    # Output buffer as bytearray (no numpy)
+    # Output buffer as bytearray
     output_buf = cl.Buffer(ctx, cl.mem_flags.WRITE_ONLY, size=64)
 
     prg.sha512(queue, (1,), None, data_buf, output_buf, length_buf)

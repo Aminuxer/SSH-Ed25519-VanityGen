@@ -21,7 +21,7 @@ except ImportError as e:
 
 P = 2**255 - 19
 
-# ctypes helpers to replace numpy arrays
+# ctypes helpers (bigint arrays)
 c_uint64_4 = ctypes.c_uint64 * 4
 c_uint8_32 = ctypes.c_uint8 * 32
 
@@ -234,7 +234,7 @@ def run_opencl_test(kernel_code, function_name, input_buffers, output_size, buff
     return ctypes_to_list(result_arr)
 
 """CPU reference: add two 256-bit values mod 2^256, limb by limb."""
-def numpy_add_256(a, b):
+def ref_add_256(a, b):
     result = [0, 0, 0, 0]
     carry = 0
     for i in range(4):
@@ -244,7 +244,7 @@ def numpy_add_256(a, b):
     return result
 
 """CPU reference: subtract two 256-bit values mod 2^256, limb by limb."""
-def numpy_sub_256(a, b):
+def ref_sub_256(a, b):
     result = [0, 0, 0, 0]
     borrow = 0
     for i in range(4):
@@ -254,14 +254,14 @@ def numpy_sub_256(a, b):
     return result
 
 """CPU reference: reduce x mod p = 2^255 - 19 using Python pow."""
-def numpy_mod_p_reduce(x):
+def ref_mod_p_reduce(x):
     """Reference: Python big-int modulo P. Ground truth."""
     full_value = sum(int(x[i]) << (64 * i) for i in range(4))
     result_val = full_value % P
     return to_256bit_array(result_val)
 
 """CPU reference: multiply two 256-bit values mod p using Python pow."""
-def numpy_mul_mod_p(a, b):
+def ref_mul_mod_p(a, b):
     a_val = sum(int(a[i]) << (64*i) for i in range(4))
     b_val = sum(int(b[i]) << (64*i) for i in range(4))
     result_val = (a_val * b_val) % P
@@ -269,21 +269,21 @@ def numpy_mul_mod_p(a, b):
 
 
 """CPU reference: compute modular inverse a^(p-2) mod p using Python pow."""
-def numpy_mod_p_inverse(a):
+def ref_mod_p_inverse(a):
     a_val = sum(int(a[i]) << (64*i) for i in range(4))
     result_val = pow(a_val, P-2, P)
     return to_256bit_array(result_val)
 
 
 """CPU reference: convert 32-byte LE seed to 4x64-bit scalar."""
-def numpy_seed_to_scalar(seed):
+def ref_seed_to_scalar(seed):
     result = [0, 0, 0, 0]
     for i in range(32):
         result[i // 8] |= (seed[i] << ((i % 8) * 8))
     return result
 
 """CPU reference: convert 4x64-bit scalar to 32-byte LE list."""
-def numpy_scalar_to_bytes(scalar):
+def ref_scalar_to_bytes(scalar):
     """CPU reference: scalar_to_bytes -- LITTLE-ENDIAN byte order.
     limb[0] (LSB) -> bytes[0..3], limb[3] (MSB) -> bytes[24..31]"""
     result = []
@@ -313,7 +313,7 @@ def test_add_256(kernel_code):
         test_cases.append((f"Random pair {i+1}", a_arr, b_arr))
     all_passed = True
     for name, a, b in test_cases:
-        expected = numpy_add_256(a, b)
+        expected = ref_add_256(a, b)
         result = run_opencl_test(kernel_code, "add_256", [(a, ctypes.c_uint64), (b, ctypes.c_uint64)], 32, [cl.mem_flags.READ_ONLY, cl.mem_flags.READ_ONLY, cl.mem_flags.WRITE_ONLY])
         if result == expected:
             print(f"  PASS: {name} {result}")
@@ -344,7 +344,7 @@ def test_sub_256(kernel_code):
     ]
     all_passed = True
     for name, a, b in test_cases:
-        expected = numpy_sub_256(a, b)
+        expected = ref_sub_256(a, b)
         result = run_opencl_test(kernel_code, "sub_256", [(a, ctypes.c_uint64), (b, ctypes.c_uint64)], 32, [cl.mem_flags.READ_ONLY, cl.mem_flags.READ_ONLY, cl.mem_flags.WRITE_ONLY])
         if result == expected:
             print(f"  PASS: {name} {result}")
@@ -457,7 +457,7 @@ def test_mod_p_reduce(kernel_code):
 
     all_passed = True
     for name, input_val in test_cases:
-        expected = numpy_mod_p_reduce(input_val)
+        expected = ref_mod_p_reduce(input_val)
         result = [0, 0, 0, 0]
         result = run_opencl_test_single_inout(kernel_code, "mod_p_reduce", (input_val, ctypes.c_uint64))
         if result == expected:
@@ -486,7 +486,7 @@ def test_mul_mod_p(kernel_code):
     ]
     all_passed = True
     for name, a, b in test_cases:
-        expected = numpy_mul_mod_p(a, b)
+        expected = ref_mul_mod_p(a, b)
         result = run_opencl_test(kernel_code, "mul_mod_p", [(a, ctypes.c_uint64), (b, ctypes.c_uint64)], 32, [cl.mem_flags.READ_ONLY, cl.mem_flags.READ_ONLY, cl.mem_flags.WRITE_ONLY])
         if result == expected:
             print(f"  PASS: {name} {result}")
@@ -512,7 +512,7 @@ def test_mod_p_inverse(kernel_code):
     ]
     all_passed = True
     for name, a, _ in test_cases:
-        expected = numpy_mod_p_inverse(a)
+        expected = ref_mod_p_inverse(a)
         dst = ctypes.c_uint64 * 4
         result = run_opencl_test_two_out(kernel_code, "mod_p_inverse", (a, ctypes.c_uint64), (dst(0, 0, 0, 0), ctypes.c_uint64))
         if result == expected:
@@ -639,7 +639,7 @@ def main():
             print(f"Testing add_256: {a_val} + {b_val}")
             a_arr = to_256bit_array(a_val)
             b_arr = to_256bit_array(b_val)
-            expected = numpy_add_256(a_arr, b_arr)
+            expected = ref_add_256(a_arr, b_arr)
             result = run_opencl_test(kernel_code, "add_256", [(a_arr, ctypes.c_uint64), (b_arr, ctypes.c_uint64)], 32,
                                     [cl.mem_flags.READ_ONLY, cl.mem_flags.READ_ONLY, cl.mem_flags.WRITE_ONLY])
             if result == expected:
@@ -655,7 +655,7 @@ def main():
             print(f"Testing sub_256: {a_val} - {b_val}")
             a_arr = to_256bit_array(a_val)
             b_arr = to_256bit_array(b_val)
-            expected = numpy_sub_256(a_arr, b_arr)
+            expected = ref_sub_256(a_arr, b_arr)
             result = run_opencl_test(kernel_code, "sub_256", [(a_arr, ctypes.c_uint64), (b_arr, ctypes.c_uint64)], 32,
                                     [cl.mem_flags.READ_ONLY, cl.mem_flags.READ_ONLY, cl.mem_flags.WRITE_ONLY])
             if result == expected:
@@ -715,7 +715,7 @@ def main():
             # Test mod_p_reduce with custom a
             print(f"Testing mod_p_reduce: {a_val} mod (2^255 - 19)")
             a_arr = to_256bit_array(a_val)
-            expected = numpy_mod_p_reduce(a_arr)
+            expected = ref_mod_p_reduce(a_arr)
             result_ctypes = ctypes.c_uint64 * 4
             result = result_ctypes(0, 0, 0, 0)
             result = run_opencl_test_single_inout(kernel_code, "mod_p_reduce", (a_arr, ctypes.c_uint64))
@@ -732,7 +732,7 @@ def main():
             print(f"Testing mul_mod_p: ({a_val} * {b_val}) mod (2^255 - 19)")
             a_arr = to_256bit_array(a_val)
             b_arr = to_256bit_array(b_val)
-            expected = numpy_mul_mod_p(a_arr, b_arr)
+            expected = ref_mul_mod_p(a_arr, b_arr)
             result = run_opencl_test(kernel_code, "mul_mod_p", [(a_arr, ctypes.c_uint64), (b_arr, ctypes.c_uint64)], 32,
                                     [cl.mem_flags.READ_ONLY, cl.mem_flags.READ_ONLY, cl.mem_flags.WRITE_ONLY])
             if result == expected:
@@ -747,7 +747,7 @@ def main():
             # Test mod_p_inverse with custom a
             print(f"Testing mod_p_inverse: {a_val}^(-1) mod (2^255 - 19)")
             a_arr = to_256bit_array(a_val)
-            expected = numpy_mod_p_inverse(a_arr)
+            expected = ref_mod_p_inverse(a_arr)
             result_ctypes = ctypes.c_uint64 * 4
             result = result_ctypes(0, 0, 0, 0)
             result = run_opencl_test_two_out(kernel_code, "mod_p_inverse", (a_arr, ctypes.c_uint64), (result, ctypes.c_uint64))
@@ -769,7 +769,7 @@ def main():
                 seed_bytes = bytes([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32])
             scalar_ctypes = ctypes.c_uint64 * 4
             scalar = scalar_ctypes(0, 0, 0, 0)
-            expected = numpy_seed_to_scalar(seed_bytes)
+            expected = ref_seed_to_scalar(seed_bytes)
             scalar = run_opencl_test_two_out(kernel_code, "seed_to_scalar", (seed_bytes, ctypes.c_uint8), (scalar, ctypes.c_uint64))
             if ctypes_to_list(scalar) == expected:
                 print(f"  PASS")
@@ -784,7 +784,7 @@ def main():
             print(f"Testing scalar_to_bytes: {a_val}")
             a_arr = to_256bit_array(a_val)
             bytes_out = bytes([0] * 32)
-            expected = numpy_scalar_to_bytes(a_arr)
+            expected = ref_scalar_to_bytes(a_arr)
             result = run_opencl_test_two_out(kernel_code, "scalar_to_bytes", (a_arr, ctypes.c_uint64), (bytes_out, ctypes.c_uint8))
             result_bytes = bytes(result)
             expected_bytes = bytes(expected)

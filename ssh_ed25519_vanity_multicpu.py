@@ -4,7 +4,7 @@
      Ed-25519 SSH Vanity Key Generator [Multi CPU thread, FAST]
      100% AI-Generated: QWEN-Coder-Next 80B/3B
      Inspired by Aminuxer     https://github.com/Aminuxer/SSH-Ed25519-VanityGen
-     Version 2026-07-30--N-CPU
+     Version 2026-08-12--N-CPU
 
 Usage:
     python3 ssh_ed25519_vanity_multicpu.py <pattern> [-i] [-w <workers>] [-o output_file] [--debug]
@@ -89,10 +89,12 @@ def worker_loop(patterns: List[str], case_insensitive: bool, result_queue, stop_
     current_seed_int = int.from_bytes(os.urandom(32), 'big')
     max_seed = (1 << 256) - 1  # 2^256 - 1
 
+    if debug_mode:
+        print(f"      CPU init seed (hex): {hex(current_seed_int)}")
+
     pat_checks = [(p, p.lower() if case_insensitive else p) for p in patterns]
     iterations = 0
     last_progress_time = _time_func()
-    batch_size = 1024768
 
     while not stop_event.is_set():
         try:

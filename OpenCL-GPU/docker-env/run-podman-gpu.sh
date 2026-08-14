@@ -5,7 +5,7 @@
 # ==============================================================================
 # Usage: ./run-podman-gpu.sh <pattern> [args...]
 #   - Automatically detects:
-#     1. Container runtime (podman preferred, docker as fallback)
+#     1. Container runtime (podman prefer, docker as fallback)
 #     2. OS family (Fedora/RHEL-family vs Debian/Ubuntu)
 #     3. GPU vendor (NVIDIA vs AMD)
 #   - Builds the appropriate Dockerfile.*
@@ -15,6 +15,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 
 # ---------------------------------------------------------------------------
 # Resolve a path to absolute form
@@ -331,9 +332,9 @@ main() {
     chmod 1777 /tmp/aminuxer-gpu-vanity-cache
 
     # Clean up stale container from previous runs
-    if $CONTAINER_TOOL container inspect ssh-25519-vanity &>/dev/null; then
-        echo "Removing stale container ssh-25519-vanity ..."
-        $CONTAINER_TOOL rm -f ssh-25519-vanity 2>/dev/null || true
+    if $CONTAINER_TOOL container inspect ssh-25519-vanity-gpu &>/dev/null; then
+        echo "Removing stale container ssh-25519-vanity-gpu ..."
+        $CONTAINER_TOOL rm -f ssh-25519-vanity-gpu 2>/dev/null || true
     fi
 
     # Build final argument list: pattern (if any) + rebuilt args
@@ -344,7 +345,7 @@ main() {
     final_args+=("$@")
 
     exec $CONTAINER_TOOL run \
-        --name ssh-25519-vanity \
+        --name ssh-25519-vanity-gpu \
         --read-only \
         --tmpfs /tmp \
         ${pattern_file_mount} \
@@ -356,3 +357,4 @@ main() {
 }
 
 main "$@"
+

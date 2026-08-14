@@ -1,0 +1,25 @@
+# ==============================================================================
+# SSH-Ed25519-VanityGen - CPU Multi-Thread
+# ==============================================================================
+# Base: python:3.14-slim (~200 MB). No GPU required.
+# Only dependency: cryptography (ed25519 key generation).
+#
+# Build context must be the top-level Ed-25519-SSH-Vanity/ directory
+# (the parent of OpenCL-GPU/, where ssh_ed25519_vanity_multicpu.py lives).
+#   podman build -f docker-env/Dockerfile.cpu -t cpu-vanity:latest ~/Ed-25519-SSH-Vanity/
+# ==============================================================================
+
+FROM python:3.14-slim
+
+# Install cryptography + create non-root user in one layer.
+RUN pip install --no-cache-dir cryptography && \
+    useradd --create-home --shell /bin/bash aminuxer && \
+    chown -R aminuxer:aminuxer /home/aminuxer
+
+COPY ssh_ed25519_vanity_multicpu.py /app/
+
+WORKDIR /app
+
+USER aminuxer
+
+ENTRYPOINT ["python", "/app/ssh_ed25519_vanity_multicpu.py"]

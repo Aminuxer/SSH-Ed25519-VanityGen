@@ -1,0 +1,22 @@
+# ==============================================================================
+# SSH-Ed25519-VanityGen - CPU Multi-Thread (Alpine)
+# ==============================================================================
+# Base: alpine:3.20 + python3 + py3-cryptography (~50 MB).
+# Lightest option. musl libc — verify cryptography C extension works.
+#
+# Build context: Ed-25519-SSH-Vanity/ (where ssh_ed25519_vanity_multicpu.py lives)
+#   podman build -f Dockerfile.cpu-alpine -t cpu-vanity-alpine:latest ~/Ed-25519-SSH-Vanity/
+# ==============================================================================
+
+FROM alpine:3.20
+
+RUN apk add --no-cache python3 py3-cryptography && \
+    adduser -D -s /bin/bash aminuxer
+
+COPY ssh_ed25519_vanity_multicpu.py /app/
+
+WORKDIR /app
+
+USER aminuxer
+
+ENTRYPOINT ["python3", "/app/ssh_ed25519_vanity_multicpu.py"]

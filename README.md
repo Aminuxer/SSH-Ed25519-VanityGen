@@ -189,6 +189,20 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
 * Will be RegExp support added for patterns ?
   - No. Too slow function.
 
+* I catch issues with environment prepare.
+  - try to install pip-deps in user-profile with _pip-install-deps.sh
+  - try to make venv profile with _pip-install-deps_manual_venv.sh
+  - try use podman/docker with run-podman-gpu.sh / run-podman-cpu.sh
+
+* How to run containers ? What difference ?
+  - OpenCL-GPU/docker-env/run-podman-gpu.sh - GPU-version. try detect container toolkit (podman/docker), GPU vendor and OS family (different glibc / opencl driver).
+    Run calculation on GPU in container. See podman images -a / podman ps -a with names 25519*gpu
+  - docker-env/run-podman-cpu.sh CPU-version, build container from Dockerfile.cpu based on python3.14-slim
+    Run calculation on CPU in container. See podman images -a / podman ps -a with names 25519*cpu
+  - docker-env/run-podman-cpu-alpine.sh CPU-version, build container from Dockerfile.cpu-alpine based on alpine-linux (musl library)
+    Run calculation on CPU in container. See podman images -a / podman ps -a with names 25519*cpu-alpine
+  This containers easy to run over sh-scripts for correct mount OpenCL-files and drivers, path mapping and file-related options.
+
 * How fast keys checked ?
 
 ##### CPU:

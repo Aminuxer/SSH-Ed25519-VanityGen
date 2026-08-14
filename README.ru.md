@@ -187,6 +187,21 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
 * Будет ли добавлена поддержка регулярных выражений для шаблонов ?
   - Точно нет. Они слишком медленные.
 
+
+* Столкнулся со сложностями подготовки окружения.
+  - Попробуйте установить pip-зависимости в профиль пользователя с помощью _pip-install-deps.sh
+  - Попробуйте сделать отдельный venv профиль с помощью _pip-install-deps_manual_venv.sh
+  - Попробуйте использовать podman/docker с помощью скриптов run-podman-gpu.sh / run-podman-cpu.sh
+
+* Как запускать контейнеры ? Чем они отличаются ?
+  - OpenCL-GPU/docker-env/run-podman-gpu.sh - GPU-версия, пробует детектить контейнерную среду (podman/docker), проивзодителя GPU и семейство ОС (разные glibc / opencl драйверы).
+    Запускает вычисления на GPU в контейнере. Смотрите podman images -a / podman ps -a с именами вида 25519*gpu
+  - docker-env/run-podman-cpu.sh CPU-версия, собирает контейнер из Dockerfile.cpu на основе python3.14-slim
+    Запускает вычисления на CPU в контейнере. Смотрите podman images -a / podman ps -a с именами вида 25519*cpu
+  - docker-env/run-podman-cpu-alpine.sh CPU-версия, собирает контейнер из Dockerfile.cpu-alpine на основе alpine-linux (библиотека musl)
+    Запускает вычисления на CPU в контейнере с альпин-линуксом. Смотрите podman images -a / podman ps -a с именами вида 25519*cpu-alpine
+  Эти контейнеры проще всего запускать через sh-скрипты для корректной работы OpenCL-библиотек и драйверов, маппинга путей и файловых параметров.
+
 * Как быстро проверяются ключи ?
 
 ##### CPU:

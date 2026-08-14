@@ -1,0 +1,39 @@
+# ==============================================================================
+# SSH-Ed25519-VanityGen - GPU OpenCL (NVIDIA / AMD, Debian/Ubuntu)
+# ==============================================================================
+# Base: python:3.14-slim (~200 MB). glibc-compatible with Debian/Ubuntu hosts.
+# GPU drivers and OpenCL libs mounted from host at runtime via /usr/lib64.
+# GPU script and OpenCL kernel sources are copied from the parent directory.
+# ==============================================================================
+
+FROM python:3.14-slim
+
+# Install system cryptography + create user + venv + install pyopencl.
+# All RUN steps merged into one layer to avoid dangling intermediate images.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3-cryptography python3-venv python3-pip && \
+    rm -rf /var/lib/apt/lists/* && \
+    useradd --create-home --shell /bin/bash aminuxer && \
+    python3 -m venv /home/aminuxer/venv && \
+    /home/aminuxer/venv/bin/pip install --no-cache-dir --upgrade pip && \
+    /home/aminuxer/venv/bin/pip install --no-cache-dir \
+        "pyopencl>=2026.1" && \
+    mkdir -p /home/aminuxer/.nv/ComputeCache && \
+    chown -R aminuxer:aminuxer /home/aminuxer
+
+# Copy GPU script and OpenCL kernels from build context (parent dir).
+COPY big_math.cl ed25519.cl ed25519_static_tables.cl openssh.cl \
+    sha512.cl vanity_sshgen.cl ssh_ed25519_vanity_gpu_opencl.py \
+    /app/OpenCL-GPU/
+
+WORKDIR /app/OpenCL-GPU
+
+# NVIDIA OpenCL ComputeCache: host mount via run-podman-gpu.sh
+#   -v /tmp/aminuxer-gpu-vanity-cache:/home/aminuxer/.nv/ComputeCache:rw
+ENV PATH=/home/aminuxer/venv/bin:${PATH}
+
+USER aminuxer
+ENV VIRTUAL_ENV=/home/aminuxer/venv
+
+# Use venv python as entry point.
+ENTRYPOINT ["python", "/app/OpenCL-GPU/ssh_ed25519_vanity_gpu_opencl.py"]

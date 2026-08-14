@@ -1,0 +1,37 @@
+# ==============================================================================
+# SSH-Ed25519-VanityGen - GPU OpenCL (NVIDIA / AMD, Fedora/RHEL-family)
+# ==============================================================================
+# Base: fedora-minimal (~100 MB). glibc-compatible with Fedora/RHEL/CentOS hosts.
+# GPU drivers and OpenCL libs mounted from host at runtime via /usr/lib64.
+# GPU script and OpenCL kernel sources are copied from the parent directory.
+# ==============================================================================
+
+FROM fedora-minimal
+
+# Disable fedora-cisco-openh264 — weak dep repo, never needed, causes slow fetches.
+# Uses --disablerepo which works with both dnf4 and dnf5.
+# All RUN steps merged into one layer to avoid dangling intermediate images.
+RUN dnf install -y --disablerepo=fedora-cisco-openh264 \
+        --setopt=install_weak_deps=False \
+        python3 python3-pip python3-cryptography && \
+    dnf clean all && \
+    useradd --create-home --shell /bin/bash aminuxer && \
+    python3 -m venv --system-site-packages /home/aminuxer/venv && \
+    /home/aminuxer/venv/bin/pip install --no-cache-dir --upgrade pip && \
+    /home/aminuxer/venv/bin/pip install --no-cache-dir "pyopencl>=2026.1" && \
+    mkdir -p /home/aminuxer/.nv/ComputeCache /home/aminuxer/.cache/pytools && \
+    chown -R aminuxer:aminuxer /home/aminuxer
+
+# Copy GPU script and OpenCL kernels from build context (parent dir).
+COPY big_math.cl ed25519.cl ed25519_static_tables.cl openssh.cl \
+    sha512.cl vanity_sshgen.cl ssh_ed25519_vanity_gpu_opencl.py \
+    /app/OpenCL-GPU/
+
+WORKDIR /app/OpenCL-GPU
+
+USER aminuxer
+ENV VIRTUAL_ENV=/home/aminuxer/venv
+ENV PATH=/home/aminuxer/venv/bin:${PATH}
+
+# Use venv python as entry point.
+ENTRYPOINT ["python", "/app/OpenCL-GPU/ssh_ed25519_vanity_gpu_opencl.py"]

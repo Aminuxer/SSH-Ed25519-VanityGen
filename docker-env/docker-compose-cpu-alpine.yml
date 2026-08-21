@@ -1,0 +1,43 @@
+# ==============================================================================
+# SSH-Ed25519-VanityGen - CPU Multi-Thread (Alpine) — docker compose
+# ==============================================================================
+# Build context: project root (parent of docker-env/), where
+# ssh_ed25519_vanity_multicpu.py lives.
+#
+# Quick start (args REPLACE the default command):
+#   docker compose -f docker-env/docker-compose-cpu-alpine.yml -p vanity-cpu-alpine  run --rm vanity User -w 6 -i -o /output/user_key
+#   docker compose -f docker-env/docker-compose-cpu-alpine.yml -p vanity-cpu-alpine run --rm vanity --patterns-file /input_patterns/patterns.txt -o /output/KEYS
+#
+# Or just run the default command:
+#   docker compose -f docker-env/docker-compose-cpu-alpine.yml -p vanity-cpu-alpine  up --build
+#
+# Works with `podman compose` as well.
+# ==============================================================================
+
+services:
+  vanity:
+    build:
+      context: ..
+      dockerfile: docker-env/Dockerfile.cpu-alpine
+    image: aminuxer-ssh-ed25519-cpu-vanity-alpine:latest
+    container_name: ssh-25519-vanity-cpu-alpine
+    read_only: true
+    tmpfs:
+      - /tmp
+    # No network: generator is pure CPU math, nothing to connect to.
+    network_mode: "none"
+    # Mounts are optional — uncomment what you need.
+    # NOTE: -o inside the container must stay inside a mounted directory
+    # (the container is read-only except tmpfs /tmp and these mounts).
+    #
+    # Patterns file (read-only):
+    #   host file        -> container path
+    # - ./patterns.txt:/input_patterns/patterns.txt:ro
+    #
+    # Output directory (read-write), for -o /output/<name>:
+    # - ./output:/output:rw
+    #
+    # Default command: example from README.ru.md.
+    # Override at runtime: docker compose run vanity <pattern> -w <N> ...
+    command: ["User", "-w", "4", "-i"]
+    restart: "no"

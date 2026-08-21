@@ -203,6 +203,7 @@ main() {
         --name ssh-25519-vanity-cpu-alpine \
         --read-only \
         --tmpfs /tmp \
+        --network none \
         ${pattern_file_mount} \
         ${output_dir_mount} \
         "${image_tag}" "${final_args[@]}"

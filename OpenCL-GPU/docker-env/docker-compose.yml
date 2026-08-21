@@ -1,0 +1,64 @@
+# ==============================================================================
+# SSH-Ed25519-VanityGen - GPU OpenCL (Debian/Ubuntu base) — docker compose
+# ==============================================================================
+# Build context: OpenCL-GPU/ (parent of docker-env/), where the .cl kernels
+# and ssh_ed25519_vanity_gpu_opencl.py live.
+#
+# GPU: NVIDIA devices active by default (mirrors run-podman-gpu.sh).
+# AMD hosts: comment the NVIDIA devices block, uncomment the AMD one,
+# and use image tag aminuxer-ssh-ed25519-gpu-vanity-amd:latest.
+#
+# Prereq — host cache dir (the script does this automatically, compose does not):
+#   mkdir -p /tmp/aminuxer-gpu-vanity-cache && chmod 1777 /tmp/aminuxer-gpu-vanity-cache
+#
+# Quick start (args REPLACE the default command):
+#   docker compose -f OpenCL-GPU/docker-env/docker-compose.yml -p gpu-debian run --rm vanity User -i -o /output/user_key
+#   docker compose -f OpenCL-GPU/docker-env/docker-compose.yml -p gpu-debian run --rm vanity --patterns-file /input_patterns/patterns.txt -o /output/KEYS
+#
+# Or just run the default command:
+#   docker compose -f OpenCL-GPU/docker-env/docker-compose.yml -p gpu-debian up --build
+#
+# Works with `podman compose` as well.
+# ==============================================================================
+
+services:
+  vanity:
+    build:
+      context: ..
+      dockerfile: docker-env/Dockerfile.debian
+    # Tag matches run-podman-gpu.sh (nvidia). NOTE: the fedora file uses the
+    # same tag too (script convention) — building one replaces the other's image.
+    image: aminuxer-ssh-ed25519-gpu-vanity:latest
+    container_name: ssh-25519-vanity-gpu
+    read_only: true
+    tmpfs:
+      - /tmp
+    # No network: generator is pure GPU/CPU math, nothing to connect to.
+    network_mode: "none"
+    # --- GPU devices: NVIDIA (as in run-podman-gpu.sh) ---
+    devices:
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia-uvm:/dev/nvidia-uvm
+      - /dev/nvidia-uvm-tools:/dev/nvidia-uvm-tools
+      - /dev/nvidia-caps:/dev/nvidia-caps
+    # --- AMD instead of NVIDIA: comment the block above, uncomment this ---
+    # devices:
+    #   - /dev/dri:/dev/dri
+    #   - /dev/kfd:/dev/kfd
+    # Host OpenCL runtime: driver libs + vendor ICD (needed for both vendors).
+    # Cache dir: must exist on host (mkdir -p + chmod 1777 before first run).
+    volumes:
+      - /usr/lib64:/usr/lib64:ro
+      - /etc/OpenCL:/etc/OpenCL:ro
+      - /tmp/aminuxer-gpu-vanity-cache:/home/aminuxer/.cache:rw
+      - /tmp/aminuxer-gpu-vanity-cache:/home/aminuxer/.nv/ComputeCache:rw
+    #
+    # Patterns file (read-only) and output dir (read-write) are optional:
+    # - ./patterns.txt:/input_patterns/patterns.txt:ro
+    # - ./output:/output:rw
+    #
+    # Default command: example from README.
+    # Override at runtime: docker compose run vanity <pattern> -w <N> ...
+    command: ["User", "-w", "4", "-i"]
+    restart: "no"

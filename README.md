@@ -241,6 +241,8 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
      C = ( ln(1/(1‑P)) * 64^N ) / ( 45‑N )
     
      $$ C = \frac{64^{N} \ln \bigl(\frac{1}{1-P}\bigr)}{45 - N} $$
+     or with normalization:
+    $$ C(N, p) = 2^{256} \left[ 1 - \exp\left( -\frac{64^N \ln\!\left(\frac{1}{1-p}\right)}{(45 - N) \cdot 2^{256}} \right) \right] $$
     
      Table with estimated keys count for target probability:
 

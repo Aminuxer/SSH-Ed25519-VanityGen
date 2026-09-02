@@ -258,7 +258,7 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
 
 or with normalization:
 
-    $$ C(N, p) = 2^{256} \left[ 1 - \exp\left( -\frac{64^N \ln \left(\frac{1}{1-p}\right)}{(45 - N) \cdot 2^{256}} \right) \right] $$
+$$ C(N, p) = 2^{256} \left[ 1 - \exp\left( -\frac{64^N \ln \left(\frac{1}{1-p}\right)}{(45 - N) \cdot 2^{256}} \right) \right] $$
 
 * My hardware too old (i686) and python too old also (3.6).
   - Run CPU-version with --debug option for benchmark;

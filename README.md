@@ -234,6 +234,7 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
 | GTX 1070 | 15 * 1024 | 15360 | 320 000 |
 | GTX 1080 Ti | 28 * 1024 | 28672 | 590 000 |
 | GTX 3060 | 28 * 1024 | 28672 | 800 000 |
+| RTX 5070 | 48 * 1024 | 49152 | 2 730 000 |
 | H100 NVL | 132 * 1024 | 135168 | 5 170 000 |
 
 * How many keys need brute until found key ?

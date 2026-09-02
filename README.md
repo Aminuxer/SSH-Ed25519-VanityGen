@@ -241,9 +241,6 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
      C = ( ln(1/(1‑P)) * 64^N ) / ( 45‑N )
     
      $$ C = \frac{64^{N} \ln \bigl(\frac{1}{1-P}\bigr)}{45 - N} $$
-     or with normalization:
-    $$ C(N, p) = 2^{256} \left[ 1 - \exp\left( -\frac{64^N \ln \left(\frac{1}{1-p}\right)}{(45 - N) \cdot 2^{256}} \right) \right] $$
-    
      Table with estimated keys count for target probability:
 
 | N \ P | 50 | 90 | 99 | 99,9 |
@@ -258,6 +255,9 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
 | 9 | 346850820453631 | 1152213485199650 | 2304426970399298 | 3456640455599000 |
 | 10 | 22832694009290500 | 75848567711428400 | 151697135422857000 | 227545703134289000 |
 
+or with normalization:
+    $$ C(N, p) = 2^{256} \left[ 1 - \exp\left( -\frac{64^N \ln \left(\frac{1}{1-p}\right)}{(45 - N) \cdot 2^{256}} \right) \right] $$
+    
 * My hardware too old (i686) and python too old also (3.6).
   - Run CPU-version with --debug option for benchmark;
   - Use seed (this data is secret !!) for generate keypair wuth **seed-2-openssh-key.py** on more fresh equipment;

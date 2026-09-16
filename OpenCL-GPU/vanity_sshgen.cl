@@ -1,9 +1,9 @@
-// vanity_sshgen.cl - GPU kernel for vanity SSH key search
+// vanity_sshgen.cl - GPU kernel for vanity SSH key search (v. 2026-09-11)
 // Includes the tested pipeline files:
 //   sha512.cl   - SHA512_H, sha512_transform, little_s0, little_s1
-//   big_math.cl - mod_p_reduce, mul_mod_p, mod_p_inverse, scalar_to_bytes
+//   big_math.cl - mod_p_reduce, mul_mod_p, copy_256, scalar_to_bytes
 //   ed25519.cl  - scalar_mult
-//   openssh.cl  - BASE64_TABLE (plus __kernel funcs we don't call here)
+//   openssh.cl  - BASE64_TABLE
 //
 // SEED LIFECYCLE:
 //   - CPU generates random seeds ONCE at startup, uploads to GPU (READ_WRITE)
@@ -11,30 +11,52 @@
 //   - On NEXT kernel launch, the same work-item gets the already-incremented seed
 //   - NO H2D seed transfers in the main loop - seeds live and mutate on GPU
 //
-// The kernel (per work-item):
+// THE KERNEL (per work-item):
 //   1. Load seed from seeds[idx*32..(idx+1)*32]
 //   2. SHA512(seed) -> expanded[64]
 //   3. Clamp expanded[0..31] -> scalar (LE interpretation, RFC 8032)
 //   4. scalar_mult -> projective point (Ed25519)
-//   5. Affine Y + sign bit -> 32-byte public key
-//   6. Build SSH blob + Base64 encode (51 -> 68 chars)
-//   7. Match pattern in variable part (base64[pos 25+])
-//   8. If matched: write seed to foundSeeds, pattern idx to results
-//   9. Increment seed by 1 (256-bit LE with carry) back to seeds buffer
+//   5. BATCHED affine inverse: the 32 work-items of this workgroup invert
+//      their rZ values together in shared memory (see below)
+//   6. Affine Y + sign bit -> 32-byte public key
+//   7. Build SSH blob + Base64 encode (51 -> 68 chars)
+//   8. Match pattern in variable part (base64[pos 25+])
+//   9. If matched: write [seed 32][pub 32] to foundSeeds, pattern idx to results
+//  10. Increment seed by 1 (256-bit LE with carry) back to seeds buffer
 //
-// Output:
+// 2026-09-11 CHANGES:
+//   The per-candidate modular inverse of rZ no longer uses the 8KB
+//   per-work-item squaring chain T[1020] (507 field muls + large private
+//   memory spill). All 32 work-items of a workgroup batch-invert their
+//   Z values in __local memory:
+//     a) publish rZ to __local Zlg[lid]
+//     b) inclusive prefix scan  P[i] = Z[0]*...*Z[i]         (5 mul-steps)
+//     c) Fermat T = P[31]^(p-2) with the exponent chain SPLIT across
+//        the 32 lanes: lane j computes V_j = (a^(2^(8j)))^(E_j)
+//        where a = P[31] and E = p-2 = sum_j E_j * 2^(8j):
+//        E_0 = 0xEB, E_1..E_30 = 0xFF, E_31 = 0x7F
+//        (lane j does 8j squarings; the warp cost is the max = 248)
+//     d) inclusive product scan of V: T = V_0*...*V_31        (5 mul-steps)
+//     e) inclusive suffix scan  Q[i] = Z[i]*...*Z[31]         (5 mul-steps)
+//     f) Zinv[i] = T * P[i-1] * Q[i+1]   (P[-1] = Q[32] = 1)
+//   Inverse cost: ~270 warp-mul steps per 32 candidates (~8.5/candidate)
+//   vs 507 per candidate in V1, and no per-item 8KB private spill.
+//   Everything else (signature, seed lifecycle, blob, base64, match)
+//   is identical to V1. Found entry = [seed 32][pub 32] (64 bytes).
+//
+// Output (2026-09-16):
 //   results[i]     = pattern index (0-based) if matched, -1 otherwise
-//   foundSeeds[i]  = the seed bytes that produced the match (only valid if results[i]>=0)
+//                    (GPU-side bookkeeping only; host does NOT read it)
+//   matchCount     = atomic counter of matches in this launch (int).
+//                    The host resets it to 0 before every launch.
+//   foundSeeds     = match entries indexed by atomic slot, stride 68:
+//                    [seed 32][pub 32][pat_idx 4]
 
 #include "./sha512.cl"
 #include "./big_math.cl"
 #include "./ed25519.cl"
 #include "./openssh.cl"
 
-/* Main kernel: for each work-item, generate a vanity SSH key.
-   Pipeline: load seed -> SHA512 -> clamp -> scalar_mult -> inverse -> base64 -> pattern match.
-   Seed is incremented on each launch so the same work-item continues from where it left off.
-   Precomputed squaring chain T is built from rZ to speed up modular inverse. */
 __kernel void vanity_search(
     __global uchar* seeds,           // READ_WRITE: 32-byte LE seeds, incremented each launch
     const int numSeeds,
@@ -44,10 +66,12 @@ __kernel void vanity_search(
     const int numPatterns,
     __global int* results,
     __global uchar* pubKeyOut,
-    __global uchar* foundSeeds        // write seed on match (only valid when results[idx]>=0)
+    __global uchar* foundSeeds,       // write [seed 32][pub 32][pat 4] on match (stride 68)
+    __global int* matchCount          // atomic match counter, host resets to 0 per batch
 ) {
     int idx = (int)get_global_id(0);
     if (idx >= numSeeds) return;
+    int lid = (int)get_local_id(0);  // 0..31 (workgroup size is 32)
 
     // -- Load seed (256-bit LE) -----------------------------------------
     uchar seed[32];
@@ -101,21 +125,132 @@ __kernel void vanity_search(
     scalar[31] |= 0x40;
 
     // -- 3. scalar_mult -> projective (X, Y, Z) --------------------------
-    ulong rX[4], rY[8], rZ[8];
+    ulong rX[4], rY[4], rZ[4];
     scalar_mult(scalar, rX, rY, rZ);
 
-    // -- 4. Precompute Z^(2^k) table for Montgomery inverse --------------
-    // T[k*4..k*4+3] = rZ^(2^k) for k=0..254 (flat array, 1020 bytes)
-    ulong T[1020];
-    mod_p_reduce(rZ);
-    copy_256(rZ, T);
-    for (int k = 1; k < 255; k++)
-        mul_mod_p(T+(k-1)*4, T+(k-1)*4, T+k*4);
+    // -- 4. Batched affine inverse (workgroup of 32) ---------------------
+    // CONSTRAINT (Pascal / CUDA-OpenCL driver on this host): passing a __local
+    // pointer to a generic-pointer helper (copy_256 / mul_mod_p) crashes the
+    // kernel at launch (clWaitForEvents -9999). All __local accesses below use
+    // direct indexing; helper calls operate on __private arrays only.
+    __local ulong Zlg[32][4];
+    __local ulong Plg[32][4];
+    __local ulong Vlg[32][4];
+    __local ulong Qlg[32][4];
 
-    // -- 5. Affine Y + sign bit -> public key -----------------------------
-    // Use precomputed table for mod_p_inverse
-    ulong rZi[4], rYa[8], rXi[8];
-    mod_p_inverse(T, rZi);
+    mod_p_reduce(rZ);
+    Zlg[lid][0] = rZ[0];
+    Zlg[lid][1] = rZ[1];
+    Zlg[lid][2] = rZ[2];
+    Zlg[lid][3] = rZ[3];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // 4a. Inclusive prefix: P[i] = Z[0]*...*Z[i]
+    Plg[lid][0] = Zlg[lid][0];
+    Plg[lid][1] = Zlg[lid][1];
+    Plg[lid][2] = Zlg[lid][2];
+    Plg[lid][3] = Zlg[lid][3];
+    for (int s = 1; s < 32; s <<= 1) {
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (lid >= s) {
+            ulong A[4], B[4], R[4];
+            A[0] = Plg[lid - s][0]; A[1] = Plg[lid - s][1];
+            A[2] = Plg[lid - s][2]; A[3] = Plg[lid - s][3];
+            B[0] = Plg[lid][0];     B[1] = Plg[lid][1];
+            B[2] = Plg[lid][2];     B[3] = Plg[lid][3];
+            mul_mod_p(A, B, R);
+            Plg[lid][0] = R[0]; Plg[lid][1] = R[1];
+            Plg[lid][2] = R[2]; Plg[lid][3] = R[3];
+        }
+    }
+
+    // 4b. Fermat T = P[31]^(p-2), exponent chain split across the 32 lanes.
+    {
+        ulong s4[4], w4[4], tmp4[4];
+        s4[0] = Plg[31][0]; s4[1] = Plg[31][1];
+        s4[2] = Plg[31][2]; s4[3] = Plg[31][3];
+        for (int k = 0; k < 8 * lid; k++) {
+            mul_mod_p(s4, s4, tmp4);
+            s4[0] = tmp4[0]; s4[1] = tmp4[1];
+            s4[2] = tmp4[2]; s4[3] = tmp4[3];
+        }
+        uint Ej = (lid == 0) ? 0x000000EBu
+                 : ((lid < 31) ? 0xFFFFFFFFu : 0x0000007Fu);
+        one_256(w4);
+        for (int b = 7; b >= 0; b--) {
+            mul_mod_p(w4, w4, tmp4);
+            w4[0] = tmp4[0]; w4[1] = tmp4[1];
+            w4[2] = tmp4[2]; w4[3] = tmp4[3];
+            if (((Ej >> b) & 1u) != 0u) {
+                mul_mod_p(w4, s4, tmp4);
+                w4[0] = tmp4[0]; w4[1] = tmp4[1];
+                w4[2] = tmp4[2]; w4[3] = tmp4[3];
+            }
+        }
+        Vlg[lid][0] = w4[0]; Vlg[lid][1] = w4[1];
+        Vlg[lid][2] = w4[2]; Vlg[lid][3] = w4[3];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // 4c. Inclusive product of V: V[31] = T = P[31]^(p-2)
+    for (int s = 1; s < 32; s <<= 1) {
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (lid >= s) {
+            ulong A[4], B[4], R[4];
+            A[0] = Vlg[lid - s][0]; A[1] = Vlg[lid - s][1];
+            A[2] = Vlg[lid - s][2]; A[3] = Vlg[lid - s][3];
+            B[0] = Vlg[lid][0];     B[1] = Vlg[lid][1];
+            B[2] = Vlg[lid][2];     B[3] = Vlg[lid][3];
+            mul_mod_p(A, B, R);
+            Vlg[lid][0] = R[0]; Vlg[lid][1] = R[1];
+            Vlg[lid][2] = R[2]; Vlg[lid][3] = R[3];
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // 4d. Inclusive suffix: Q[i] = Z[i]*...*Z[31]
+    Qlg[lid][0] = Zlg[lid][0];
+    Qlg[lid][1] = Zlg[lid][1];
+    Qlg[lid][2] = Zlg[lid][2];
+    Qlg[lid][3] = Zlg[lid][3];
+    for (int s = 1; s < 32; s <<= 1) {
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (lid + s <= 31) {
+            ulong A[4], B[4], R[4];
+            A[0] = Qlg[lid + s][0]; A[1] = Qlg[lid + s][1];
+            A[2] = Qlg[lid + s][2]; A[3] = Qlg[lid + s][3];
+            B[0] = Qlg[lid][0];     B[1] = Qlg[lid][1];
+            B[2] = Qlg[lid][2];     B[3] = Qlg[lid][3];
+            mul_mod_p(A, B, R);
+            Qlg[lid][0] = R[0]; Qlg[lid][1] = R[1];
+            Qlg[lid][2] = R[2]; Qlg[lid][3] = R[3];
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // 4e. Zinv[lid] = T * P[lid-1] * Q[lid+1]   (P[-1] = Q[32] = 1)
+    ulong rZi[4], T[4], Qp[4], Pm[4], tmp4b[4];
+    T[0] = Vlg[31][0]; T[1] = Vlg[31][1];
+    T[2] = Vlg[31][2]; T[3] = Vlg[31][3];
+    if (lid == 0) {
+        Qp[0] = Qlg[1][0]; Qp[1] = Qlg[1][1];
+        Qp[2] = Qlg[1][2]; Qp[3] = Qlg[1][3];
+        mul_mod_p(T, Qp, rZi);
+    } else if (lid == 31) {
+        Pm[0] = Plg[30][0]; Pm[1] = Plg[30][1];
+        Pm[2] = Plg[30][2]; Pm[3] = Plg[30][3];
+        mul_mod_p(T, Pm, rZi);
+    } else {
+        Qp[0] = Qlg[lid + 1][0]; Qp[1] = Qlg[lid + 1][1];
+        Qp[2] = Qlg[lid + 1][2]; Qp[3] = Qlg[lid + 1][3];
+        mul_mod_p(T, Qp, tmp4b);
+        Pm[0] = Plg[lid - 1][0]; Pm[1] = Plg[lid - 1][1];
+        Pm[2] = Plg[lid - 1][2]; Pm[3] = Plg[lid - 1][3];
+        mul_mod_p(tmp4b, Pm, rZi);
+    }
+
+    // 4f. Affine Y + sign bit -> public key
+    ulong rYa[4], rXi[4];
     mul_mod_p(rY, rZi, rYa);    // affine Y = rY / rZ mod p
     mul_mod_p(rX, rZi, rXi);    // affine X = rX / rZ mod p (for sign bit)
 
@@ -176,14 +311,30 @@ __kernel void vanity_search(
     // -- 8. Write results ----------------------------------------------
     results[idx] = foundPat;
     if (foundPat >= 0) {
-        // Write the MATCHING seed (BEFORE increment) so CPU can reproduce it
-        for (int i = 0; i < 32; i++)
-            foundSeeds[idx * 32 + i] = seed[i];
+        // 2026-09-16: GPU-side match bookkeeping. The kernel accounts the
+        // match in the atomic counter; the host reads ONLY the counter
+        // (4 bytes per batch) and, when non-zero, the entries below.
+        // Entry layout: [seed 32][pub 32][pat_idx 4], stride 68, indexed
+        // by the atomic slot. At most one entry per work-item per launch
+        // and the host resets the counter to 0 before every launch, so
+        // slot < numSeeds. The seed written is the MATCHING one
+        // (BEFORE the increment below), so the CPU can rebuild the key
+        // without recomputing anything.
+        int slot = atomic_inc(matchCount);
+        if (slot < numSeeds) {
+            uchar* e = foundSeeds + slot * 68;
+            for (int i = 0; i < 32; i++)
+                e[i] = seed[i];
+            for (int i = 0; i < 32; i++)
+                e[32 + i] = pubkey[i];
+            e[64] = (uchar)(foundPat & 0xFF);
+            e[65] = (uchar)((foundPat >> 8) & 0xFF);
+            e[66] = (uchar)((foundPat >> 16) & 0xFF);
+            e[67] = (uchar)((foundPat >> 24) & 0xFF);
+        }
     }
 
     // -- 9. Increment seed by 1 (256-bit LE with carry) ----------------
-    // Each work-item owns its seed and increments it independently.
-    // No synchronization needed - work-items don't share seed indices.
     {
         unsigned carry = 1;
         for (int i = 0; i < 32; i++) {

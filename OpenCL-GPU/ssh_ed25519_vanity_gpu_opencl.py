@@ -4,12 +4,8 @@
 Ed-25519 SSH Vanity Key Generator [OpenCL GPU]
 Port of ssh_ed25519_vanity_multicpu.py to GPU via OpenCL.
 ** Inspired by Aminuxer
-** Version: 2026-08-12--N-GPU
+** Version: 2026-09-11
 
-GPU TIMEOUT PROTECTION:
-- queue.finish() wrapped with threading timeout
-- Kernel launch + D2H wait wrapped with threading timeout
-- Main-loop watchdog terminates workers silent > WATCHDOG_TIMEOUT_SEC
 
 Usage:
     python3 ssh_ed25519_vanity_gpu_opencl.py <pattern> [-i] [-w <workers>] [-o output] [--debug]
@@ -18,18 +14,23 @@ Usage:
 GPU-specific options:
     --opencl-devices a,b,c     Use specific device IDs (ignores -w)
     --load-percent 1-100       % of GPU cores to use (default: 100)
+    --batch-mult 1-16          Multiply the per-launch batch (default: 1)
 """
 
-# GPU timeout constants (seconds)
-GPU_OP_TIMEOUT   = 30   # max wait for queue.finish() / event.wait()
-KERNEL_TIMEOUT   = 120  # max wait for kernel launch + D2H pipeline
-WATCHDOG_TIMEOUT = 60   # worker silent this long -> terminate
+# Fault-tolerance constants (seconds)
+KERNEL_TIMEOUT   = 120  # one pipeline event wait beyond this => GPU dead
+WATCHDOG_TIMEOUT = 60   # worker silent this long => main kills + retries
+MAX_GPU_ATTEMPTS = 10   # respawn attempts per GPU, then excluded
+RETRY_BACKOFF_SEC = (30, 60, 120, 300)  # capped at 300s
+PROGRESS_FLUSH_SEC = 0.25
 
 import os
 import sys
 import time
 import re
+import signal
 import array
+import base64
 import struct
 import ctypes
 import pyopencl as cl
@@ -113,7 +114,7 @@ def format_duration(seconds):
 
 """Validate vanity pattern: length 2-30, base64 chars only."""
 def validate_pattern(pattern):
-    """Check if pattern contains only valid Base64 characters."""
+    """Check pattern contains only valid Base64 characters."""
     if len(pattern) > 44:
         return False
     return all(c in B64_CHARS for c in pattern)
@@ -123,6 +124,58 @@ def validate_pattern(pattern):
 def sanitize_filename(name):
     """Replace invalid filename characters with underscores."""
     return re.sub(r'[^a-zA-Z0-9\-_.]', '_', name)
+
+
+def _ssh_str(b):
+    """OpenSSH wire format: uint32 length prefix + bytes."""
+    return struct.pack(">I", len(b)) + b
+
+
+"""Build an unencrypted openssh-key-v1 ed25519 private key from seed + public key.
+
+The cryptography library cannot serialize a key from a raw (seed, pubkey)
+pair, so the OpenSSH wire format is assembled directly. Layout follows
+sshkey.c sshkey_private_to_blob2() byte-for-byte:
+
+    magic "openssh-key-v1\0"
+    string  ciphername "none"
+    string  kdfname    "none"
+    string  kdf        ""
+    uint32  number of keys (1)          <- RAW u32, not a string
+    string  public key blob
+    uint32  private section length
+    private section:
+        uint32  check                   <- random, written TWICE
+        uint32  check
+        string  keytype "ssh-ed25519"
+        string  pubkey  (32 bytes)
+        string  privkey (64 bytes: seed32 || pubkey32)
+        string  comment
+        padding bytes 1,2,3,... so the section length % 8 == 0
+
+OpenSSH stores the RFC 8032 seed and re-derives the clamped scalar from it
+at signing time, so seed32 must be the actual seed that produced pubkey32.
+"""
+def build_openssh_private_key(pubkey32, seed32, comment=b""):
+    keytype = b"ssh-ed25519"
+    public_blob = _ssh_str(keytype) + _ssh_str(pubkey32)
+    check = os.urandom(4)
+    private = (check + check
+               + _ssh_str(keytype)
+               + _ssh_str(pubkey32)
+               + _ssh_str(seed32 + pubkey32)
+               + _ssh_str(comment))
+    pad_len = 8 - (len(private) % 8)
+    private += bytes(range(1, pad_len + 1))
+    blob = (b"openssh-key-v1\x00"
+            + _ssh_str(b"none") + _ssh_str(b"none") + _ssh_str(b"")
+            + struct.pack(">I", 1)
+            + _ssh_str(public_blob) + _ssh_str(private))
+    b64 = base64.b64encode(blob).decode()
+    # ssh-keygen wraps the base64 body at 70 columns
+    b64 = "\n".join(b64[i:i + 70] for i in range(0, len(b64), 70))
+    return ("-----BEGIN OPENSSH PRIVATE KEY-----\n" + b64
+            + "\n-----END OPENSSH PRIVATE KEY-----\n")
 
 
 """Discover all available GPU OpenCL devices across platforms."""
@@ -137,20 +190,53 @@ def get_all_gpu_devices():
 
 # --- GPU Worker ---------------------------------------------------------
 
-"""Worker function for one GPU: compile kernel, run vanity search loop, report progress."""
+"""Worker function for one GPU: compile kernel, run vanity search loop, report.
+
+Fault model (one worker = one GPU = one process):
+  - init failure / device list changed  -> ('gpu-dead', reason), exit
+  - pipeline event wait timeout         -> ('gpu-dead', reason), exit
+  - parent process died                 -> silent exit (orphan guard)
+  - stop_event set                      -> clean ('done', iterations)
+The main process owns all retries; a worker never retries itself.
+"""
 def worker_gpu(device_idx, patterns, case_insensitive,
                 result_queue, stop_event,
-                found_flags, kernel_path, load_percent):
-    """GPU worker process -- runs OpenCL kernel in a loop.
-
-    SEED LIFECYCLE:
-      - Random seeds generated ONCE at startup via os.urandom()
-      - Uploaded to GPU READ_WRITE buffer ONCE
-      - Kernel increments each seed by 1 (256-bit LE) after each launch
-      - NO H2D seed transfers in the main loop
-      - On match: kernel writes the matching seed to foundSeeds buffer
-    """
+                found_flags, kernel_path, load_percent,
+                n_devices_expected, batch_mult):
+    import threading
     import traceback
+
+    ppid0 = os.getppid()
+
+    def parent_alive():
+        return os.getppid() == ppid0
+
+    def gpu_dead(reason):
+        """Report death and exit. The process exit is the only reliable
+        cleanup of a wedged OpenCL context, so this never returns."""
+        try:
+            result_queue.put(('gpu-dead', reason), timeout=5)
+        except Exception:
+            pass
+        os._exit(1)
+
+    def wait_event(evt, timeout=KERNEL_TIMEOUT):
+        """evt.wait() with a wall-clock timeout (driver has none).
+
+        Returns True if the event completed in time, False otherwise.
+        """
+        done = []
+
+        def _w(e=evt):
+            try:
+                e.wait()
+                done.append(True)
+            except Exception:
+                done.append(False)
+        th = threading.Thread(target=_w, daemon=True)
+        th.start()
+        th.join(timeout=timeout)
+        return bool(done) and done[0]
 
     pat_count = len(patterns)
     # Prepare pattern data for GPU (32-byte padded slots)
@@ -164,18 +250,15 @@ def worker_gpu(device_idx, patterns, case_insensitive,
         pat_lens.append(len(pbytes))
         pat_ci.append(1 if case_insensitive else 0)
 
-    pat_bytes_np = bytearray(bytes(pat_bytes))
-    pat_lens_np  = bytearray(bytes(pat_lens))
-    pat_ci_np    = bytearray(bytes(pat_ci))
-
-    # Init OpenCL
+    # -- Init OpenCL ----------------------------------------------------
     try:
-        platforms = cl.get_platforms()
-        all_devices = get_all_gpu_devices()
-        if device_idx >= len(all_devices):
-            result_queue.put(('error', f"Device index {device_idx} out of range"))
-            return
-        platform, device = all_devices[device_idx]
+        devices = get_all_gpu_devices()
+        if len(devices) != n_devices_expected:
+            gpu_dead(f"device list changed: expected {n_devices_expected} GPUs, "
+                     f"seen {len(devices)}")
+        if device_idx >= len(devices):
+            gpu_dead(f"device index {device_idx} out of range ({len(devices)})")
+        platform, device = devices[device_idx]
         dev_name = device.name
 
         mf = cl.mem_flags
@@ -187,154 +270,185 @@ def worker_gpu(device_idx, patterns, case_insensitive,
         kernel_src = inline_cl(kernel_path, kernel_dir)
         program = cl.Program(ctx, kernel_src).build()
         kernel = cl.Kernel(program, 'vanity_search')
-        # Signal main process that this worker is ready
-        result_queue.put(('ready', device_idx))
 
         # Determine work size
         max_wg = device.get_info(cl.device_info.MAX_WORK_GROUP_SIZE)
         max_cu = device.get_info(cl.device_info.MAX_COMPUTE_UNITS)
         local_size = 32
-        desired_global = int(max_wg * max_cu * load_percent / 100)
+        desired_global = int(max_wg * max_cu * load_percent / 100) * batch_mult
         batch_size = (desired_global // local_size) * local_size
         if batch_size == 0:
             batch_size = local_size
 
         print(f"[*] GPU [{device_idx}] {dev_name}: global={batch_size}, "
-              f"local={local_size}, load={load_percent}%, patterns={pat_count}",
-              flush=True)
+              f"local={local_size}, load={load_percent}%, batch_mult={batch_mult}, "
+              f"patterns={pat_count}", flush=True)
+        # Signal main process that this worker is ready
+        result_queue.put(('ready', device_idx))
     except Exception as e:
-        result_queue.put(('error', f"GPU init failed: {e}\n{traceback.format_exc()}"))
-        return
+        gpu_dead(f"GPU init failed: {e}\n{traceback.format_exc()}")
 
     # -- Allocate persistent GPU buffers --------------------------------
     mf = cl.mem_flags
-    seeds_buf     = cl.Buffer(ctx, mf.READ_WRITE, batch_size * 32)
-    results_buf   = cl.Buffer(ctx, mf.READ_WRITE, batch_size * 4)
-    pubkey_buf    = cl.Buffer(ctx, mf.READ_WRITE, batch_size * 32)
-    found_seeds_buf = cl.Buffer(ctx, mf.READ_WRITE, batch_size * 32)
-    pat_bytes_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pat_bytes_np)
-    pat_lens_buf  = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pat_lens_np)
-    pat_ci_buf    = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pat_ci_np)
+    seeds_buf   = cl.Buffer(ctx, mf.READ_WRITE, batch_size * 32)
+    # results/pubkey: written by the kernel for debugging/verification,
+    # the host NEVER reads them in the search loop.
+    results_buf = cl.Buffer(ctx, mf.READ_WRITE, batch_size * 4)
+    pubkey_buf  = cl.Buffer(ctx, mf.READ_WRITE, batch_size * 32)
+    # Ring of 3 (deeper pipeline than ping-pong): batch N uses slot N%3;
+    # the host processes batch N-2's counter, which is guaranteed
+    # complete by then. The GPU queue stays full -> no starvation.
+    found_bufs  = [cl.Buffer(ctx, mf.READ_WRITE, batch_size * 68) for _ in range(3)]
+    count_bufs  = [cl.Buffer(ctx, mf.READ_WRITE, 4) for _ in range(3)]
+    pat_bytes_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=bytes(pat_bytes))
+    pat_lens_buf  = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=bytes(pat_lens))
+    pat_ci_buf    = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=bytes(pat_ci))
 
     # -- Generate random seeds ONCE and upload ONCE ---------------------
-    seeds_np = bytearray(os.urandom(batch_size * 32))
-    cl.enqueue_copy(queue, seeds_buf, seeds_np, is_blocking=True)
+    cl.enqueue_copy(queue, seeds_buf, os.urandom(batch_size * 32), is_blocking=True)
+    zeros4 = array.array('i', [0])
+    for b in count_bufs:
+        cl.enqueue_copy(queue, b, zeros4, is_blocking=True)
 
-    # -- P0: Single results buffer + blocking copy (no ping-pong, no event hang)
-    neg1 = struct.pack("<" + "i" * batch_size, *([-1] * batch_size))
-    curr_results = array.array("i", neg1)
-    found_seeds_np = bytearray(batch_size * 32)
+    count_host = [array.array('i', [0]) for _ in range(3)]
 
     iterations = 0
-    last_prog_time = time.monotonic()
+    n_batches = 0
     last_prog_iter = 0
-    matched_count = 0
+    last_prog_put = time.monotonic()
+    evt_ring = [None, None, None]  # counter D2H event per ring slot
 
-    # -- P0: Double-buffered pipeline restored, but with timeout-safe event wait
-    neg1 = struct.pack("<" + "i" * batch_size, *([-1] * batch_size))
-    results_A = array.array("i", neg1)
-    results_B = array.array("i", neg1)
-    found_seeds_np = bytearray(batch_size * 32)
-    curr_results = results_A
-    prev_results = results_B
-    pending_evt = None
+    # Optional per-phase timing (VANTITY_PROFILE=1): printed every
+    # 500 batches as averages in microseconds.
+    prof = os.environ.get('VANTITY_PROFILE') == '1'
+    prof_acc = [0.0, 0.0, 0.0, 0.0]  # launch, wait, process, reset
+    prof_n = 0
 
     try:
         while not stop_event.is_set():
-            # -- 1. Launch kernel (GPU computes batch N) + D2H queue --------
+            # Orphan guard: parent (the farm) died -> release the GPU.
+            if not parent_alive():
+                os._exit(0)
+
+            idx = n_batches % 3
+            if prof:
+                _t = time.monotonic()
+            # -- 1. Launch kernel (batch N) + 4-byte counter D2H --------
             kernel.set_args(
                 seeds_buf,
                 ctypes.c_int32(batch_size),
                 pat_bytes_buf, pat_lens_buf, pat_ci_buf,
                 ctypes.c_int32(pat_count),
                 results_buf, pubkey_buf,
-                found_seeds_buf,
+                found_bufs[idx], count_bufs[idx],
             )
             cl.enqueue_nd_range_kernel(queue, kernel,
-                                       (batch_size,),
-                                       (local_size,))
-            cur_copy_evt = cl.enqueue_copy(queue, curr_results, results_buf,
-                                           is_blocking=False)
+                                       (batch_size,), (local_size,))
+            evt = cl.enqueue_copy(queue, count_host[idx], count_bufs[idx],
+                                  is_blocking=False)
+            evt_ring[idx] = evt
+            if prof:
+                prof_acc[0] += time.monotonic() - _t
 
-            # -- 2. Wait for previous batch's D2H + process results ----------
-            #    All CPU-side blocking ops wrapped in thread with timeout.
-            #    If GPU is dead, this prevents the worker from hanging.
-            _iter_done = [False]
-            _cur_evt = cur_copy_evt
-            _pend_evt = pending_evt
+            # -- 2. Wait for batch N-2's counter + process it -----------
+            #    Two batches behind its own kernel: guaranteed complete,
+            #    and the GPU queue already holds newer kernels, so the
+            #    CPU wait never starves the GPU.
+            if n_batches >= 2:
+                proc_idx = (n_batches - 2) % 3
+                if prof:
+                    _t = time.monotonic()
+                if not wait_event(evt_ring[proc_idx]):
+                    gpu_dead(f"pipeline event wait > {KERNEL_TIMEOUT}s "
+                             f"(GPU or driver wedged)")
+                if prof:
+                    prof_acc[1] += time.monotonic() - _t
+                n_matches = count_host[proc_idx][0]
+                if prof:
+                    _t = time.monotonic()
+                if n_matches > 0:
+                    # CPU work only here: final assembly data for found
+                    # keys. The host buffer is exactly as big as needed.
+                    found_host = bytearray(n_matches * 68)
+                    f_evt = cl.enqueue_copy(queue, found_host,
+                                            found_bufs[proc_idx],
+                                            is_blocking=False)
+                    if not wait_event(f_evt):
+                        gpu_dead("found-entries D2H wait timeout")
+                    for k in range(n_matches):
+                        entry = found_host[k * 68:(k + 1) * 68]
+                        pat_idx = int.from_bytes(entry[64:68], 'little')
+                        if pat_idx >= pat_count:
+                            continue  # defensive: never happens
+                        with found_flags.get_lock():
+                            if found_flags[pat_idx] != 0:
+                                continue  # another worker got it first
+                            found_flags[pat_idx] = 1
+                        # Sync accumulated progress so the farm total is
+                        # accurate by the time the main reports the key.
+                        if iterations - last_prog_iter > 0:
+                            try:
+                                result_queue.put(
+                                    ('progress', iterations - last_prog_iter),
+                                    block=False)
+                            except Exception:
+                                pass
+                            last_prog_iter = iterations
+                        result_queue.put(('found', {
+                            'pattern_idx': pat_idx,
+                            'seed': entry[:32].hex(),
+                            'pub': entry[32:64].hex(),
+                            'iterations': iterations,
+                        }))
+                    # Reset the consumed counter. Rare (only on match):
+                    # the 4-byte H2D enqueue stalls ~7ms on this driver
+                    # while a kernel is in flight, so it must NOT run
+                    # on the common no-match path (counter is already 0).
+                    # Queue ordering guarantees it lands before the next
+                    # kernel that reuses this counter (batch N+1).
+                    if prof:
+                        prof_acc[2] += time.monotonic() - _t
+                        _t = time.monotonic()
+                    cl.enqueue_copy(queue, count_bufs[proc_idx], zeros4,
+                                    is_blocking=False)
+                    if prof:
+                        prof_acc[3] += time.monotonic() - _t
+                elif prof:
+                    prof_acc[2] += time.monotonic() - _t
 
-            def _batch_work():
-                try:
-                    if _pend_evt is not None:
-                        _pend_evt.wait()
-                    queue.finish()
-                    _iter_done[0] = True
-                except Exception:
-                    pass
-
-            _bw = __import__('threading').Thread(target=_batch_work, daemon=True)
-            _bw.start()
-            _bw.join(timeout=KERNEL_TIMEOUT)
-
-            if not _iter_done[0]:
-                # Entire pipeline hang (GPU dead or driver stuck).
-                # Skip this batch — GPU may still be computing, so we
-                # advance iteration count and progress to keep watchdog happy.
-                iterations += batch_size
-                if iterations - last_prog_iter >= batch_size:
-                    try:
-                        result_queue.put(('progress', batch_size), block=False)
-                    except Exception:
-                        pass
-                    last_prog_iter = iterations
-                pending_evt = _cur_evt
-                curr_results, prev_results = prev_results, curr_results
-                continue
-
-            # -- 3. Process PREVIOUS batch results on CPU ------------------
+            # -- 3. Bookkeeping ------------------------------------------
+            n_batches += 1
             iterations += batch_size
 
-            # Send progress report to main loop
-            if iterations - last_prog_iter >= batch_size:
+            if prof:
+                prof_n += 1
+                if prof_n % 500 == 0:
+                    avg = [v * 1e6 / prof_n for v in prof_acc]
+                    sys.stderr.write(
+                        f"[prof] GPU{device_idx} n={prof_n} "
+                        f"launch={avg[0]:.0f}us wait={avg[1]:.0f}us "
+                        f"process={avg[2]:.0f}us reset={avg[3]:.0f}us "
+                        f"cpu_total={sum(avg):.0f}us\n")
+                    sys.stderr.flush()
+                    prof_acc = [0.0, 0.0, 0.0, 0.0]
+                    prof_n = 0
+
+            now = time.monotonic()
+            if now - last_prog_put >= PROGRESS_FLUSH_SEC:
                 try:
-                    result_queue.put(('progress', iterations - last_prog_iter), block=False)
+                    result_queue.put(('progress', iterations - last_prog_iter),
+                                     block=False)
                 except Exception:
                     pass
                 last_prog_iter = iterations
-
-            match_indices = tuple(i for i, x in enumerate(prev_results) if x >= 0)
-            if len(match_indices) > 0:
-                cl.enqueue_copy(queue, found_seeds_np, found_seeds_buf,
-                                is_blocking=False)
-                # queue.finish() already called in _batch_work() above
-
-                for i in match_indices:
-                    pat_idx = int(prev_results[i])
-                    try:
-                        with found_flags.get_lock():
-                            if found_flags[pat_idx] == 0:
-                                found_flags[pat_idx] = 1
-                            else:
-                                continue
-                    except Exception:
-                        continue
-
-                    seed_hex = found_seeds_np[i*32:(i+1)*32].hex()
-                    result_queue.put(('found', {
-                        'pattern_idx': pat_idx,
-                        'seed': seed_hex,
-                        'iterations': iterations,
-                    }))
-                    matched_count += 1
-
-            # -- 5. Swap ping-pong buffers ---------------------------------
-            curr_results, prev_results = prev_results, curr_results
-            pending_evt = cur_copy_evt
+                last_prog_put = now
 
     except Exception as e:
-        result_queue.put(('error', f"Worker loop error: {e}\n{traceback.format_exc()}"))
+        gpu_dead(f"worker loop error: {e}\n{traceback.format_exc()}")
     finally:
-        for buf in [seeds_buf, results_buf, pubkey_buf, found_seeds_buf,
+        for buf in [seeds_buf, results_buf, pubkey_buf,
+                    found_bufs[0], found_bufs[1], found_bufs[2],
+                    count_bufs[0], count_bufs[1], count_bufs[2],
                     pat_bytes_buf, pat_lens_buf, pat_ci_buf]:
             try:
                 buf.release()
@@ -350,12 +464,41 @@ def worker_gpu(device_idx, patterns, case_insensitive,
 
 # --- Main logic ---------------------------------------------------------
 
+"""Per-GPU lifecycle state owned by the main process."""
+class _GpuSlot:
+    __slots__ = ('device_idx', 'status', 'proc', 'queue', 'attempt',
+                 'next_retry', 'iterations', 'last_msg',
+                 'rate_iter', 'rate_time')
+    LAUNCHING = 'launching'
+    RUNNING = 'running'
+    RETRY = 'retry'
+    DEAD = 'dead'
+
+    def __init__(self, device_idx):
+        self.device_idx = device_idx
+        self.status = self.LAUNCHING
+        self.proc = None
+        self.queue = None
+        self.attempt = 0
+        self.next_retry = 0.0
+        self.iterations = 0
+        self.last_msg = time.monotonic()
+        self.rate_iter = 0
+        self.rate_time = time.monotonic()
+
+
 """Main entry: launch GPU workers, collect matches, write SSH keys to disk."""
 def generate_vanity_key(patterns, case_insensitive=False,
                         num_workers=None, output_file=None,
                         debug_mode=False, opencl_devices=None,
-                        load_percent=100):
-    """Generate vanity SSH keys using GPU workers."""
+                        load_percent=100, batch_mult=1):
+    """Generate vanity SSH keys using GPU workers.
+
+    Farm semantics: a GPU dying (init failure, hang, driver loss) only
+    affects that GPU. It is respawned up to MAX_GPU_ATTEMPTS times with
+    backoff, then excluded. The run ends when all patterns are found or
+    no GPU is left.
+    """
     if not patterns:
         print("[-] No valid patterns to search for")
         return None
@@ -363,7 +506,7 @@ def generate_vanity_key(patterns, case_insensitive=False,
     print(f"[*] Accepted patterns: {', '.join(patterns)}")
     print(f"[*] Case insensitive: {case_insensitive}")
     print(f"[*] Debug mode: {debug_mode}")
-    print(f"[*] Load percent: {load_percent}%")
+    print(f"[*] Load percent: {load_percent}%, batch mult: {batch_mult}")
 
     # Enumerate devices
     devices = get_all_gpu_devices()
@@ -371,7 +514,8 @@ def generate_vanity_key(patterns, case_insensitive=False,
         print("[-] No GPU devices found")
         return None
 
-    print(f"[*] Available OpenCL devices:")
+    n_devices_expected = len(devices)
+    print(f"[*] Available OpenCL devices ({n_devices_expected}):")
     for i, (plat, dev) in enumerate(devices):
         cu = dev.get_info(cl.device_info.MAX_COMPUTE_UNITS)
         wg = dev.get_info(cl.device_info.MAX_WORK_GROUP_SIZE)
@@ -381,7 +525,7 @@ def generate_vanity_key(patterns, case_insensitive=False,
     if opencl_devices is not None:
         selected = []
         for idx in opencl_devices:
-            if 0 <= idx < len(devices):
+            if 0 <= idx < n_devices_expected:
                 selected.append(idx)
             else:
                 print(f"[-] Invalid device index: {idx}")
@@ -391,8 +535,8 @@ def generate_vanity_key(patterns, case_insensitive=False,
     else:
         # If num_workers not specified, use ALL available GPUs by default
         if num_workers is None:
-            num_workers = len(devices)
-        num_workers = min(num_workers, len(devices))
+            num_workers = n_devices_expected
+        num_workers = min(num_workers, n_devices_expected)
         selected = list(range(num_workers))
         print(f"[*] Using {num_workers} GPU(s)")
 
@@ -409,216 +553,250 @@ def generate_vanity_key(patterns, case_insensitive=False,
     except RuntimeError:
         pass
 
-    result_queues  = [Queue() for _ in range(num_workers)]
-    stop_event     = Event()
-    found_flags    = Array('i', [0] * len(patterns))
+    stop_event = Event()
+    found_flags = Array('i', [0] * len(patterns))
+    slots = [_GpuSlot(i) for i in selected]
+    remaining = set(range(len(patterns)))
 
-    # Start workers
-    processes = []
-    for i, dev_idx in enumerate(selected):
-        p = Process(
+    def spawn_slot(slot):
+        slot.queue = Queue()
+        slot.proc = Process(
             target=worker_gpu,
-            args=(dev_idx, patterns, case_insensitive,
-                  result_queues[i], stop_event,
-                  found_flags, kernel_path, load_percent),
+            args=(slot.device_idx, patterns, case_insensitive,
+                  slot.queue, stop_event, found_flags, kernel_path,
+                  load_percent, n_devices_expected, batch_mult),
         )
-        p.start()
-        processes.append(p)
+        slot.attempt += 1
+        slot.status = _GpuSlot.LAUNCHING
+        slot.last_msg = time.monotonic()
+        slot.iterations = 0
+        slot.rate_iter = 0
+        slot.rate_time = time.monotonic()
+        slot.proc.start()
+        print(f"[+] GPU [{slot.device_idx}] worker started "
+              f"(attempt {slot.attempt}/{MAX_GPU_ATTEMPTS})", flush=True)
 
-    # Wait for all workers to finish kernel compilation
-    ready_count = 0
-    start_compile = time.monotonic()
-    while ready_count < len(processes):
-        got = False
-        for i, rq in enumerate(result_queues):
-            try:
-                msg_type, data = rq.get(timeout=1)
-                if msg_type == 'ready':
-                    ready_count += 1
-                    elapsed_compile = time.monotonic() - start_compile
-                    if elapsed_compile > 2.0:
-                        print(f"[+] GPU [{data}] ready ({elapsed_compile:.1f}s compile)", flush=True)
-                elif msg_type == 'error':
-                    print(f"[-] Worker error during init: {data}")
-                    stop_event.set()
-                    break
-                got = True
-            except Exception:
-                pass
-        if not got:
-            continue
-        if stop_event.is_set():
-            break
+    def reap_proc(slot):
+        proc = slot.proc
+        if proc is None:
+            return
+        try:
+            proc.join(timeout=2)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=2)
+                if proc.is_alive() and proc.pid:
+                    os.kill(proc.pid, 9)
+        except Exception:
+            pass
 
-    # Monitor loop (starts ONLY after all kernels are compiled)
+    def mark_slot_dead(slot, reason):
+        """One GPU is gone. Never touches the rest of the farm."""
+        first_line = reason.splitlines()[0] if isinstance(reason, str) else str(reason)
+        print(f"[!] GPU [{slot.device_idx}] LOST: {first_line}", flush=True)
+        reap_proc(slot)
+        slot.proc = None
+        if stop_event.is_set() or slot.attempt >= MAX_GPU_ATTEMPTS:
+            slot.status = _GpuSlot.DEAD
+            print(f"[-] GPU [{slot.device_idx}] excluded from the run "
+                  f"({slot.attempt} attempts used)", flush=True)
+        else:
+            backoff = RETRY_BACKOFF_SEC[min(slot.attempt - 1,
+                                            len(RETRY_BACKOFF_SEC) - 1)]
+            slot.status = _GpuSlot.RETRY
+            slot.next_retry = time.monotonic() + backoff
+            print(f"[*] GPU [{slot.device_idx}] retry {slot.attempt + 1}/{MAX_GPU_ATTEMPTS} "
+                  f"in {backoff}s -- farm continues on the rest", flush=True)
+
+    for slot in slots:
+        spawn_slot(slot)
+
     total_iterations = 0
     start_time = time.monotonic()
-    remaining = set(range(len(patterns)))
     first_printed = False
     progress_line = ""
+    last_prog_time = start_time
     last_pub = None
     last_pem = None
-    last_prog_time = start_time
-    # Watchdog: track last progress time per worker
-    worker_last_progress = [time.monotonic()] * num_workers
+
+    def handle_found(data):
+        """CPU's ONLY per-match job: assemble the key from GPU data."""
+        nonlocal last_pub, last_pem
+        pat_idx = data['pattern_idx']
+        if pat_idx not in remaining:
+            return  # already handled
+        remaining.discard(pat_idx)
+        matched_pat = patterns[pat_idx]
+        elapsed = time.monotonic() - start_time
+
+        if first_printed and progress_line:
+            print(f"\r{' ' * len(progress_line)}\r", end="", flush=True)
+
+        seed_bytes = bytes.fromhex(data['seed'])
+        pubkey32 = bytes.fromhex(data['pub'])
+        pub_key = ed25519.Ed25519PublicKey.from_public_bytes(pubkey32)
+
+        pub_bytes = pub_key.public_bytes(
+            encoding=serialization.Encoding.OpenSSH,
+            format=serialization.PublicFormat.OpenSSH,
+        )
+        pub_str = pub_bytes.decode()
+        priv_pem_str = build_openssh_private_key(pubkey32, seed_bytes)
+
+        print(f"\n[+] Found match for '{matched_pat}'!", flush=True)
+        print(f"[+] Public key: {pub_str} {matched_pat}", flush=True)
+        if debug_mode:
+            print(f"[+] Seed (hex): {data['seed']}", flush=True)
+
+        # Save to file or console
+        saved = False
+        if output_file:
+            try:
+                ts = time.strftime("%Y%m%d-%H%M%S")
+                safe = sanitize_filename(matched_pat)
+                base = f"{output_file}-{safe}-{ts}"
+                out_dir = os.path.dirname(output_file) or '.'
+                with open(base + '.pub', 'w') as f:
+                    f.write(pub_str + ' ' + matched_pat + '\n')
+                with open(base, 'w') as f:
+                    f.write(priv_pem_str)
+                os.chmod(base, 0o600)
+                print(f"[+] Written: {base}.pub and {base} (mode 600)", flush=True)
+                saved = True
+            except Exception as e:
+                print(f"[-] Save failed: {e}", flush=True)
+
+        if not saved:
+            print("[!] Output to console:", flush=True)
+            print(priv_pem_str, flush=True)
+
+        last_pub = pub_str
+        last_pem = priv_pem_str
+
+        if remaining:
+            print(f"[*] Continuing search for remaining "
+                  f"({len(remaining)} left)...", flush=True)
+        else:
+            print("[*] All patterns found!", flush=True)
+            stop_event.set()
 
     try:
-        while len(remaining) > 0:
-            # Check results from all worker queues
-            got = False
-            for i, rq in enumerate(result_queues):
-                try:
-                    msg_type, data = rq.get(timeout=1)
-                    got = True
+        while True:
+            now = time.monotonic()
+            live = [s for s in slots
+                    if s.status in (_GpuSlot.LAUNCHING, _GpuSlot.RUNNING)]
+            if not live:
+                break  # every GPU is dead or the global stop is set
 
-                    if msg_type == 'progress':
+            # -- Drain messages from live workers -------------------------
+            for slot in list(live):
+                while True:
+                    try:
+                        msg_type, data = slot.queue.get_nowait()
+                    except Exception:
+                        break
+                    slot.last_msg = time.monotonic()
+                    if msg_type == 'ready':
+                        if slot.status == _GpuSlot.LAUNCHING:
+                            slot.status = _GpuSlot.RUNNING
+                            print(f"[+] GPU [{slot.device_idx}] ready", flush=True)
+                    elif msg_type == 'progress':
+                        slot.iterations += data
                         total_iterations += data
-                        worker_last_progress[i] = time.monotonic()
-                        continue
-
-                    if msg_type == 'done':
+                    elif msg_type == 'found':
+                        handle_found(data)
+                    elif msg_type in ('gpu-dead', 'error'):
+                        mark_slot_dead(slot, data)
+                    elif msg_type == 'done':
+                        # Worker exited cleanly (global stop in progress).
+                        slot.status = _GpuSlot.DEAD
                         total_iterations += data
-                        worker_last_progress[i] = time.monotonic()
-                        continue
+                        break
 
-                    if msg_type == 'found':
-                        worker_last_progress[i] = time.monotonic()
-                        pat_idx = data['pattern_idx']
-                        seed_hex = data['seed']
-                        total_iterations = data.get('iterations', total_iterations)
+            # -- Watchdog: per-GPU silence (hang) --------------------------
+            for slot in list(live):
+                if slot.status not in (_GpuSlot.LAUNCHING, _GpuSlot.RUNNING):
+                    continue
+                # Fast path: the worker process is already gone (killed,
+                # OOM, crash) and its queue is drained -- no point waiting
+                # out the full heartbeat timeout.
+                if (slot.proc is not None and not slot.proc.is_alive()
+                        and not slot.queue.qsize()):
+                    mark_slot_dead(slot, "worker process terminated "
+                                         "unexpectedly (no message)")
+                    continue
+                if now - slot.last_msg > WATCHDOG_TIMEOUT:
+                    mark_slot_dead(slot, f"no heartbeat for {WATCHDOG_TIMEOUT}s "
+                                         f"(watchdog) -- process terminated")
 
-                        if pat_idx not in remaining:
-                            continue  # already handled
+            # -- Spawn due retries ----------------------------------------
+            for slot in slots:
+                if slot.status == _GpuSlot.RETRY and now >= slot.next_retry:
+                    spawn_slot(slot)
 
-                        remaining.discard(pat_idx)
-                        matched_pat = patterns[pat_idx]
-                        elapsed = time.monotonic() - start_time
+            # -- Stop conditions -------------------------------------------
+            if not remaining:
+                break
+            if all(s.status == _GpuSlot.DEAD for s in slots):
+                print("\n[-] All GPUs are dead -- nothing left to compute on.",
+                      flush=True)
+                break
 
-                        if first_printed and progress_line:
-                            print(f"\r{' ' * len(progress_line)}\r", end="", flush=True)
-
-                        # Generate key on CPU from seed
-                        seed_bytes = bytes.fromhex(seed_hex)
-                        priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(seed_bytes)
-                        pub_key  = priv_key.public_key()
-
-                        pub_bytes = pub_key.public_bytes(
-                            encoding=serialization.Encoding.OpenSSH,
-                            format=serialization.PublicFormat.OpenSSH,
-                        )
-                        pub_str = pub_bytes.decode()
-
-                        priv_pem_bytes = priv_key.private_bytes(
-                            encoding=serialization.Encoding.PEM,
-                            format=serialization.PrivateFormat.OpenSSH,
-                            encryption_algorithm=serialization.NoEncryption(),
-                        )
-                        priv_pem_str = priv_pem_bytes.decode()
-
-                        print(f"\n[+] Found match for '{matched_pat}'!")
-                        print(f"[+] Public key: {pub_str} {matched_pat}")
-                        if debug_mode:
-                            print(f"[+] Seed (hex): {seed_hex}")
-
-                        # Save to file or console
-                        saved = False
-                        if output_file:
-                            try:
-                                ts = time.strftime("%Y%m%d-%H%M%S")
-                                safe = sanitize_filename(matched_pat)
-                                base = f"{output_file}-{safe}-{ts}"
-                                out_dir = os.path.dirname(output_file) or '.'
-                                with open(base + '.pub', 'w') as f:
-                                    f.write(pub_str + ' ' + matched_pat + '\n')
-                                with open(base, 'w') as f:
-                                    f.write(priv_pem_str)
-                                os.chmod(base, 0o600)
-                                print(f"[+] Written: {base}.pub and {base} (mode 600)")
-                                saved = True
-                            except Exception as e:
-                                print(f"[-] Save failed: {e}")
-
-                        if not saved:
-                            print("[!] Output to console:")
-                            print(priv_pem_str)
-
-                        last_pub = pub_str
-                        last_pem = priv_pem_str
-
-                        if remaining:
-                            print("[*] Continuing search for remaining patterns...")
-                        else:
-                            print("[*] All patterns found!")
-                            stop_event.set()
-
-                    elif msg_type == 'error':
-                        worker_last_progress[i] = time.monotonic()
-                        print(f"[-] Worker error: {data}")
-                        stop_event.set()
-                    break  # Got a message, break inner for, re-check all queues
-                except Exception:
-                    pass
-
-            # Periodic progress display (every 5s regardless of messages)
+            # -- Periodic progress display (every 5s) -----------------------
             now = time.monotonic()
             if now - last_prog_time >= 5.0:
                 elapsed = now - start_time
                 rate = total_iterations / elapsed if elapsed > 0 else 0
+                parts = []
+                for s in slots:
+                    if s.status in (_GpuSlot.LAUNCHING, _GpuSlot.RUNNING):
+                        dt = now - s.rate_time
+                        r = (s.iterations - s.rate_iter) / dt if dt > 0 else 0
+                        parts.append(f"GPU{s.device_idx} {r / 1e6:.1f}M/s")
+                        s.rate_iter, s.rate_time = s.iterations, now
+                    elif s.status == _GpuSlot.RETRY:
+                        parts.append(
+                            f"GPU{s.device_idx} retry {s.attempt + 1}/{MAX_GPU_ATTEMPTS} "
+                            f"in {max(0, int(s.next_retry - now))}s")
+                    else:
+                        parts.append(f"GPU{s.device_idx} LOST")
                 rem = f" ({len(remaining)} left)" if remaining else ""
                 progress_line = (
-                    f"\r[+] Progress: {total_iterations:,} keys "
+                    f"\r[+] {total_iterations:,} keys "
                     f"({format_duration(elapsed)}) "
-                    f"(~{rate:,.0f} keys/sec){rem}")
-                if first_printed and progress_line:
+                    f"(~{rate:,.0f}/s){rem} | " + " | ".join(parts))
+                if first_printed:
                     print(f"\r{' ' * len(progress_line)}\r", end="", flush=True)
                 print(progress_line, end="", flush=True)
                 first_printed = True
                 last_prog_time = now
 
-            # -- Watchdog: kill workers silent for too long -----------------
-            for i, p in enumerate(processes):
-                if p.is_alive() and now - worker_last_progress[i] > WATCHDOG_TIMEOUT:
-                    pid = p.pid
-                    print(f"\n[!] Worker [{i}] (PID {pid}) silent for >{WATCHDOG_TIMEOUT}s — terminating", flush=True)
-                    p.terminate()
-                    try:
-                        p.join(timeout=3)
-                    except Exception:
-                        pass
-                    if p.is_alive():
-                        try:
-                            os.kill(pid, 9)
-                        except Exception:
-                            pass
-                    stop_event.set()
-                    worker_last_progress[i] = now  # prevent re-trigger
+            if not any(True for s in slots
+                       if s.status in (_GpuSlot.LAUNCHING, _GpuSlot.RUNNING)):
+                break
+
+            time.sleep(0.1)
 
     except KeyboardInterrupt:
         print("\n[!] Interrupted by user")
-        stop_event.set()
 
-    # Shutdown
+    # Shutdown: stop everything we own
     stop_event.set()
-    for p in processes:
-        try:
-            p.join(timeout=2)
-            if p.is_alive():
-                p.terminate()
-                p.join(timeout=1)
-        except Exception:
-            pass
+    for slot in slots:
+        reap_proc(slot)
+        slot.proc = None
 
-    if first_printed and progress_line:
+    if first_printed:
         print()
 
     elapsed = time.monotonic() - start_time
     if last_pub:
         rate = total_iterations / elapsed if elapsed > 0 else 0
         print(f"\n[+] Checked keys: {total_iterations:,} "
-              f"({format_duration(elapsed)}) (~{rate:,.0f} keys/sec)")
+              f"({format_duration(elapsed)}) (~{rate:,.0f} keys/sec)", flush=True)
         return last_pub, last_pem, total_iterations, elapsed
     else:
-        print(f"[+] Search completed. Iterations: {total_iterations:,}")
+        print(f"[+] Search ended. Iterations: {total_iterations:,}", flush=True)
         return None
 
 
@@ -630,6 +808,14 @@ def main():
         print(__doc__.strip())
         sys.exit(0)
 
+    # `kill <pid>` (SIGTERM) must stop the farm as cleanly as Ctrl-C.
+    # Background jobs of non-interactive shells inherit SIG_IGN for
+    # SIGINT, so Python never installs the KeyboardInterrupt handler
+    # there -- route SIGTERM to the same shutdown path.
+    def _term_to_kbi(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _term_to_kbi)
+
     pattern = None
     patterns_file = None
     case_insensitive = '-i' in sys.argv or '--ignore-case' in sys.argv
@@ -638,6 +824,7 @@ def main():
     output_file = None
     opencl_devices = None
     load_percent = 100
+    batch_mult = 1
 
     i = 1
     while i < len(sys.argv):
@@ -666,10 +853,20 @@ def main():
             try:
                 load_percent = int(sys.argv[i + 1])
                 if load_percent < 1 or load_percent > 100:
-                    print("[-] --load-percent must be 1..100")
+                    print("--load-percent must be 1..100")
                     sys.exit(1)
             except ValueError:
-                print("[-] --load-percent must be an integer")
+                print("--load-percent must be an integer")
+                sys.exit(1)
+            i += 2
+        elif arg == '--batch-mult' and i + 1 < len(sys.argv):
+            try:
+                batch_mult = int(sys.argv[i + 1])
+                if batch_mult < 1 or batch_mult > 16:
+                    print("--batch-mult must be 1..16")
+                    sys.exit(1)
+            except ValueError:
+                print("--batch-mult must be an integer")
                 sys.exit(1)
             i += 2
         elif arg in ('-i', '--ignore-case', '--debug'):
@@ -706,11 +903,12 @@ def main():
 
     # Output dir check
     if output_file:
-        out_dir = os.path.dirname(output_file) or '.'
-        if not os.path.isdir(out_dir):
-            print(f"[-] Warning: Output directory does not exist: {out_dir}")
-        elif not os.access(out_dir, os.W_OK):
-            print(f"[-] Warning: No write permission for: {out_dir}")
+        out_dir = os.path.dirname(output_file)
+        if out_dir:
+            if not os.path.isdir(out_dir):
+                print(f"[-] Warning: Output directory does not exist: {out_dir}")
+            elif not os.access(out_dir, os.W_OK):
+                print(f"[-] Warning: No write permission to {out_dir}")
 
     result = generate_vanity_key(
         valid_patterns,
@@ -720,6 +918,7 @@ def main():
         debug_mode=debug_mode,
         opencl_devices=opencl_devices,
         load_percent=load_percent,
+        batch_mult=batch_mult,
     )
 
     if result:

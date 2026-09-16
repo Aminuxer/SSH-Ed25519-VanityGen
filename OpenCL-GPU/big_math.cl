@@ -4,7 +4,9 @@
 //   limb[0] = bits 0..63 (bytes 0..7)
 //   limb[3] = bits 192..255 (bytes 24..31)
 
+
 // -- Basic operations -----------------------------------------
+
 
 /* Add two 256-bit values limb by limb with carry propagation. r = a + b (mod 2^256). */
 __inline void add_256(__generic const ulong* a, __generic const ulong* b, __generic ulong* r) {
@@ -17,6 +19,7 @@ __inline void add_256(__generic const ulong* a, __generic const ulong* b, __gene
         r[i] = s;
     }
 }
+
 
 /* Subtract two 256-bit values limb by limb with borrow propagation. r = a - b (mod 2^256). */
 __inline void sub_256(__generic const ulong* a, __generic const ulong* b, __generic ulong* r) {
@@ -44,6 +47,7 @@ __inline void one_256(ulong* x) {
 __inline void zero_256(ulong* x) {
     x[0] = 0; x[1] = 0; x[2] = 0; x[3] = 0;
 }
+
 
 // -- Modular reduction ----------------------------------------
 // p = 2^255 - 19
@@ -117,94 +121,320 @@ __inline void mod_p_reduce(ulong* x) {
     }
 }
 
+
 // -- Modular multiplication: r = (a * b) mod p ----------------
-// Strategy: expand to 8x32-bit, multiply with 32-bit internal accumulation,
-// pack back to 4x64-bit, fold, reduce. Reuses the proven 32-bit algorithm.
 
 /* Multiply two 256-bit values modulo p = 2^255 - 19. r = (a * b) mod p.
-   Expands to 8x32-bit limbs, does 8x8 multiplication with carry, folds high bits * 19,
-   packs back to 4x64-bit, then calls mod_p_reduce for final reduction. */
+   Fully unrolled: 8x32-bit limbs in scalar registers (no indexable arrays),
+   8x8 schoolbook multiplication with carry, hi*19 fold, mod_p_reduce.
+   Bit-exact equivalent of the former array-based implementation; the
+   scalar form avoids __private-array spills on CUDA-OpenCL (Pascal). */
 __inline void mul_mod_p(__generic const ulong* a, __generic const ulong* b, __generic ulong* r) {
-    // Expand 4x64-bit -> 8x32-bit
-    uint a32[8], b32[8];
-    for (int i = 0; i < 4; i++) {
-        a32[2*i]   = (uint)(a[i] & 0xFFFFFFFF);
-        a32[2*i+1] = (uint)(a[i] >> 32);
-        b32[2*i]   = (uint)(b[i] & 0xFFFFFFFF);
-        b32[2*i+1] = (uint)(b[i] >> 32);
-    }
+    uint a0 = (uint)a[0];  uint a1 = (uint)(a[0] >> 32);
+    uint a2 = (uint)a[1];  uint a3 = (uint)(a[1] >> 32);
+    uint a4 = (uint)a[2];  uint a5 = (uint)(a[2] >> 32);
+    uint a6 = (uint)a[3];  uint a7 = (uint)(a[3] >> 32);
+    uint b0 = (uint)b[0];  uint b1 = (uint)(b[0] >> 32);
+    uint b2 = (uint)b[1];  uint b3 = (uint)(b[1] >> 32);
+    uint b4 = (uint)b[2];  uint b5 = (uint)(b[2] >> 32);
+    uint b6 = (uint)b[3];  uint b7 = (uint)(b[3] >> 32);
 
-    // 8x8 -> 16-limb accumulator (32-bit each)
-    ulong t32[16] = {0};
-    for (int i = 0; i < 8; i++) {
+    ulong t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0, t6 = 0, t7 = 0;
+    ulong t8 = 0, t9 = 0, t10 = 0, t11 = 0, t12 = 0, t13 = 0, t14 = 0, t15 = 0;
+    ulong s;
+
+    {
         ulong ci = 0;
-        for (int j = 0; j < 8; j++) {
-            ulong prod = (ulong)a32[i] * (ulong)b32[j];
-            int k = i + j;
-            ulong s = t32[k] + (prod & 0xFFFFFFFF) + ci;
-            t32[k] = s & 0xFFFFFFFF;
-            ci = (s >> 32) + (prod >> 32);
-        }
-        int k = i + 8;
-        while (ci > 0 && k < 16) {
-            ulong s = t32[k] + ci;
-            t32[k] = s & 0xFFFFFFFF;
-            ci = s >> 32;
-            k++;
+        ulong p;
+        p = (ulong)a0 * (ulong)b0;
+        s = t0 + (uint)p + ci; t0 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a0 * (ulong)b1;
+        s = t1 + (uint)p + ci; t1 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a0 * (ulong)b2;
+        s = t2 + (uint)p + ci; t2 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a0 * (ulong)b3;
+        s = t3 + (uint)p + ci; t3 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a0 * (ulong)b4;
+        s = t4 + (uint)p + ci; t4 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a0 * (ulong)b5;
+        s = t5 + (uint)p + ci; t5 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a0 * (ulong)b6;
+        s = t6 + (uint)p + ci; t6 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a0 * (ulong)b7;
+        s = t7 + (uint)p + ci; t7 = (uint)s; ci = (s >> 32) + (p >> 32);
+    if (ci != 0) {
+        s = t8 + ci; t8 = (uint)s; ci = s >> 32;
+        if (ci != 0) {
+            s = t9 + ci; t9 = (uint)s; ci = s >> 32;
+            if (ci != 0) {
+                s = t10 + ci; t10 = (uint)s; ci = s >> 32;
+            }
         }
     }
-
-    // Fold hi*19 where hi = product >> 255
-    ulong hi[8] = {0};
-    hi[0] = (t32[7] >> 31) | ((t32[8] & 0x7FFFFFFF) << 1);
-    for (int k = 1; k < 7; k++)
-        hi[k] = (t32[8+k-1] >> 31) | ((t32[8+k] & 0x7FFFFFFF) << 1);
-    hi[7] = (t32[14] >> 31) | ((t32[15] & 0x7FFFFFFF) << 1);
-
-    // hi * 19
-    ulong h19[9] = {0};
-    for (int k = 0; k < 8; k++) {
-        ulong prod = hi[k] * 19ULL;
-        ulong lo = prod & 0xFFFFFFFF;
-        ulong s = h19[k] + lo;
-        ulong c = s >> 32;
-        h19[k] = s & 0xFFFFFFFF;
-        s = h19[k+1] + (prod >> 32) + c;
-        h19[k+1] = s & 0xFFFFFFFF;
-        h19[k+2] += s >> 32;
+    }
+    {
+        ulong ci = 0;
+        ulong p;
+        p = (ulong)a1 * (ulong)b0;
+        s = t1 + (uint)p + ci; t1 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a1 * (ulong)b1;
+        s = t2 + (uint)p + ci; t2 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a1 * (ulong)b2;
+        s = t3 + (uint)p + ci; t3 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a1 * (ulong)b3;
+        s = t4 + (uint)p + ci; t4 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a1 * (ulong)b4;
+        s = t5 + (uint)p + ci; t5 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a1 * (ulong)b5;
+        s = t6 + (uint)p + ci; t6 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a1 * (ulong)b6;
+        s = t7 + (uint)p + ci; t7 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a1 * (ulong)b7;
+        s = t8 + (uint)p + ci; t8 = (uint)s; ci = (s >> 32) + (p >> 32);
+    if (ci != 0) {
+        s = t9 + ci; t9 = (uint)s; ci = s >> 32;
+        if (ci != 0) {
+            s = t10 + ci; t10 = (uint)s; ci = s >> 32;
+            if (ci != 0) {
+                s = t11 + ci; t11 = (uint)s; ci = s >> 32;
+            }
+        }
+    }
+    }
+    {
+        ulong ci = 0;
+        ulong p;
+        p = (ulong)a2 * (ulong)b0;
+        s = t2 + (uint)p + ci; t2 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a2 * (ulong)b1;
+        s = t3 + (uint)p + ci; t3 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a2 * (ulong)b2;
+        s = t4 + (uint)p + ci; t4 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a2 * (ulong)b3;
+        s = t5 + (uint)p + ci; t5 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a2 * (ulong)b4;
+        s = t6 + (uint)p + ci; t6 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a2 * (ulong)b5;
+        s = t7 + (uint)p + ci; t7 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a2 * (ulong)b6;
+        s = t8 + (uint)p + ci; t8 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a2 * (ulong)b7;
+        s = t9 + (uint)p + ci; t9 = (uint)s; ci = (s >> 32) + (p >> 32);
+    if (ci != 0) {
+        s = t10 + ci; t10 = (uint)s; ci = s >> 32;
+        if (ci != 0) {
+            s = t11 + ci; t11 = (uint)s; ci = s >> 32;
+            if (ci != 0) {
+                s = t12 + ci; t12 = (uint)s; ci = s >> 32;
+            }
+        }
+    }
+    }
+    {
+        ulong ci = 0;
+        ulong p;
+        p = (ulong)a3 * (ulong)b0;
+        s = t3 + (uint)p + ci; t3 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a3 * (ulong)b1;
+        s = t4 + (uint)p + ci; t4 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a3 * (ulong)b2;
+        s = t5 + (uint)p + ci; t5 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a3 * (ulong)b3;
+        s = t6 + (uint)p + ci; t6 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a3 * (ulong)b4;
+        s = t7 + (uint)p + ci; t7 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a3 * (ulong)b5;
+        s = t8 + (uint)p + ci; t8 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a3 * (ulong)b6;
+        s = t9 + (uint)p + ci; t9 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a3 * (ulong)b7;
+        s = t10 + (uint)p + ci; t10 = (uint)s; ci = (s >> 32) + (p >> 32);
+    if (ci != 0) {
+        s = t11 + ci; t11 = (uint)s; ci = s >> 32;
+        if (ci != 0) {
+            s = t12 + ci; t12 = (uint)s; ci = s >> 32;
+            if (ci != 0) {
+                s = t13 + ci; t13 = (uint)s; ci = s >> 32;
+            }
+        }
+    }
+    }
+    {
+        ulong ci = 0;
+        ulong p;
+        p = (ulong)a4 * (ulong)b0;
+        s = t4 + (uint)p + ci; t4 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a4 * (ulong)b1;
+        s = t5 + (uint)p + ci; t5 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a4 * (ulong)b2;
+        s = t6 + (uint)p + ci; t6 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a4 * (ulong)b3;
+        s = t7 + (uint)p + ci; t7 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a4 * (ulong)b4;
+        s = t8 + (uint)p + ci; t8 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a4 * (ulong)b5;
+        s = t9 + (uint)p + ci; t9 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a4 * (ulong)b6;
+        s = t10 + (uint)p + ci; t10 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a4 * (ulong)b7;
+        s = t11 + (uint)p + ci; t11 = (uint)s; ci = (s >> 32) + (p >> 32);
+    if (ci != 0) {
+        s = t12 + ci; t12 = (uint)s; ci = s >> 32;
+        if (ci != 0) {
+            s = t13 + ci; t13 = (uint)s; ci = s >> 32;
+            if (ci != 0) {
+                s = t14 + ci; t14 = (uint)s; ci = s >> 32;
+            }
+        }
+    }
+    }
+    {
+        ulong ci = 0;
+        ulong p;
+        p = (ulong)a5 * (ulong)b0;
+        s = t5 + (uint)p + ci; t5 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a5 * (ulong)b1;
+        s = t6 + (uint)p + ci; t6 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a5 * (ulong)b2;
+        s = t7 + (uint)p + ci; t7 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a5 * (ulong)b3;
+        s = t8 + (uint)p + ci; t8 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a5 * (ulong)b4;
+        s = t9 + (uint)p + ci; t9 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a5 * (ulong)b5;
+        s = t10 + (uint)p + ci; t10 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a5 * (ulong)b6;
+        s = t11 + (uint)p + ci; t11 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a5 * (ulong)b7;
+        s = t12 + (uint)p + ci; t12 = (uint)s; ci = (s >> 32) + (p >> 32);
+    if (ci != 0) {
+        s = t13 + ci; t13 = (uint)s; ci = s >> 32;
+        if (ci != 0) {
+            s = t14 + ci; t14 = (uint)s; ci = s >> 32;
+            if (ci != 0) {
+                s = t15 + ci; t15 = (uint)s; ci = s >> 32;
+            }
+        }
+    }
+    }
+    {
+        ulong ci = 0;
+        ulong p;
+        p = (ulong)a6 * (ulong)b0;
+        s = t6 + (uint)p + ci; t6 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a6 * (ulong)b1;
+        s = t7 + (uint)p + ci; t7 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a6 * (ulong)b2;
+        s = t8 + (uint)p + ci; t8 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a6 * (ulong)b3;
+        s = t9 + (uint)p + ci; t9 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a6 * (ulong)b4;
+        s = t10 + (uint)p + ci; t10 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a6 * (ulong)b5;
+        s = t11 + (uint)p + ci; t11 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a6 * (ulong)b6;
+        s = t12 + (uint)p + ci; t12 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a6 * (ulong)b7;
+        s = t13 + (uint)p + ci; t13 = (uint)s; ci = (s >> 32) + (p >> 32);
+    if (ci != 0) {
+        s = t14 + ci; t14 = (uint)s; ci = s >> 32;
+        if (ci != 0) {
+            s = t15 + ci; t15 = (uint)s; ci = s >> 32;
+        }
+    }
+    }
+    {
+        ulong ci = 0;
+        ulong p;
+        p = (ulong)a7 * (ulong)b0;
+        s = t7 + (uint)p + ci; t7 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a7 * (ulong)b1;
+        s = t8 + (uint)p + ci; t8 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a7 * (ulong)b2;
+        s = t9 + (uint)p + ci; t9 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a7 * (ulong)b3;
+        s = t10 + (uint)p + ci; t10 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a7 * (ulong)b4;
+        s = t11 + (uint)p + ci; t11 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a7 * (ulong)b5;
+        s = t12 + (uint)p + ci; t12 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a7 * (ulong)b6;
+        s = t13 + (uint)p + ci; t13 = (uint)s; ci = (s >> 32) + (p >> 32);
+        p = (ulong)a7 * (ulong)b7;
+        s = t14 + (uint)p + ci; t14 = (uint)s; ci = (s >> 32) + (p >> 32);
+    if (ci != 0) {
+        s = t15 + ci; t15 = (uint)s; ci = s >> 32;
+    }
     }
 
-    // lo + h19
-    ulong res[9] = {0};
+    // hi window = bits 255..316 of the 512-bit product (62-bit windows of 19-fold)
+    ulong hi0 = (t7  >> 31) | ((t8  & 0x7FFFFFFF) << 1);
+    ulong hi1 = (t8  >> 31) | ((t9  & 0x7FFFFFFF) << 1);
+    ulong hi2 = (t9  >> 31) | ((t10 & 0x7FFFFFFF) << 1);
+    ulong hi3 = (t10 >> 31) | ((t11 & 0x7FFFFFFF) << 1);
+    ulong hi4 = (t11 >> 31) | ((t12 & 0x7FFFFFFF) << 1);
+    ulong hi5 = (t12 >> 31) | ((t13 & 0x7FFFFFFF) << 1);
+    ulong hi6 = (t13 >> 31) | ((t14 & 0x7FFFFFFF) << 1);
+    ulong hi7 = (t14 >> 31) | ((t15 & 0x7FFFFFFF) << 1);
+
+    // hi * 19 accumulated over acc0..acc8 (32-bit limbs, top may carry +2)
+    ulong acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0, acc4 = 0, acc5 = 0, acc6 = 0, acc7 = 0, acc8 = 0;
+    ulong prod, lo, c;
+    prod = hi0 * 19ULL; lo = prod & 0xFFFFFFFF;
+    s = acc0 + lo; c = s >> 32; acc0 = s & 0xFFFFFFFF;
+    s = acc1 + (prod >> 32) + c; acc1 = s & 0xFFFFFFFF; acc2 += s >> 32;
+    prod = hi1 * 19ULL; lo = prod & 0xFFFFFFFF;
+    s = acc1 + lo; c = s >> 32; acc1 = s & 0xFFFFFFFF;
+    s = acc2 + (prod >> 32) + c; acc2 = s & 0xFFFFFFFF; acc3 += s >> 32;
+    prod = hi2 * 19ULL; lo = prod & 0xFFFFFFFF;
+    s = acc2 + lo; c = s >> 32; acc2 = s & 0xFFFFFFFF;
+    s = acc3 + (prod >> 32) + c; acc3 = s & 0xFFFFFFFF; acc4 += s >> 32;
+    prod = hi3 * 19ULL; lo = prod & 0xFFFFFFFF;
+    s = acc3 + lo; c = s >> 32; acc3 = s & 0xFFFFFFFF;
+    s = acc4 + (prod >> 32) + c; acc4 = s & 0xFFFFFFFF; acc5 += s >> 32;
+    prod = hi4 * 19ULL; lo = prod & 0xFFFFFFFF;
+    s = acc4 + lo; c = s >> 32; acc4 = s & 0xFFFFFFFF;
+    s = acc5 + (prod >> 32) + c; acc5 = s & 0xFFFFFFFF; acc6 += s >> 32;
+    prod = hi5 * 19ULL; lo = prod & 0xFFFFFFFF;
+    s = acc5 + lo; c = s >> 32; acc5 = s & 0xFFFFFFFF;
+    s = acc6 + (prod >> 32) + c; acc6 = s & 0xFFFFFFFF; acc7 += s >> 32;
+    prod = hi6 * 19ULL; lo = prod & 0xFFFFFFFF;
+    s = acc6 + lo; c = s >> 32; acc6 = s & 0xFFFFFFFF;
+    s = acc7 + (prod >> 32) + c; acc7 = s & 0xFFFFFFFF; acc8 += s >> 32;
+    prod = hi7 * 19ULL; lo = prod & 0xFFFFFFFF;
+    s = acc7 + lo; c = s >> 32; acc7 = s & 0xFFFFFFFF;
+    s = acc8 + (prod >> 32) + c; acc8 = s & 0xFFFFFFFF;
+
+    // low 256 bits (top bit of t7 folded with the hi window) + acc
     ulong carry = 0;
-    for (int k = 0; k < 9; k++) {
-        ulong lo_val = (k < 7) ? t32[k] : ((k == 7) ? (t32[7] & 0x7FFFFFFF) : 0);
-        ulong s = lo_val + h19[k] + carry;
-        res[k] = s & 0xFFFFFFFF;
-        carry = s >> 32;
-    }
+    s = t0 + acc0 + carry;        ulong res0 = s & 0xFFFFFFFF; carry = s >> 32;
+    s = t1 + acc1 + carry;        ulong res1 = s & 0xFFFFFFFF; carry = s >> 32;
+    s = t2 + acc2 + carry;        ulong res2 = s & 0xFFFFFFFF; carry = s >> 32;
+    s = t3 + acc3 + carry;        ulong res3 = s & 0xFFFFFFFF; carry = s >> 32;
+    s = t4 + acc4 + carry;        ulong res4 = s & 0xFFFFFFFF; carry = s >> 32;
+    s = t5 + acc5 + carry;        ulong res5 = s & 0xFFFFFFFF; carry = s >> 32;
+    s = t6 + acc6 + carry;        ulong res6 = s & 0xFFFFFFFF; carry = s >> 32;
+    s = (t7 & 0x7FFFFFFF) + acc7 + carry; ulong res7 = s & 0xFFFFFFFF; carry = s >> 32;
+    s = acc8 + carry;             ulong res8 = s & 0xFFFFFFFF;
 
     // Fold bits 255+ (branchless)
-    ulong fold = (res[7] >> 31) | ((res[8] & 0x7FFFFFFF) << 1);
-    res[7] &= 0x7FFFFFFF;
+    ulong fold = (res7 >> 31) | ((res8 & 0x7FFFFFFF) << 1);
+    res7 &= 0x7FFFFFFF;
     ulong add19 = fold * 19ULL;
-    ulong s0 = res[0] + add19;
-    res[0] = s0 & 0xFFFFFFFF;
-    ulong c = s0 >> 32;
-    ulong s1 = res[1] + (add19 >> 32) + c;
-    res[1] = s1 & 0xFFFFFFFF;
-    c = s1 >> 32;
-    ulong s2 = res[2] + c;
-    res[2] = s2 & 0xFFFFFFFF;
-    c = s2 >> 32;
-    res[3] = (res[3] + c) & 0xFFFFFFFF;
+    s = res0 + add19; res0 = s & 0xFFFFFFFF; c = s >> 32;
+    s = res1 + (add19 >> 32) + c; res1 = s & 0xFFFFFFFF; c = s >> 32;
+    s = res2 + c; res2 = s & 0xFFFFFFFF; c = s >> 32;
+    res3 = (res3 + c) & 0xFFFFFFFF;
 
     // Pack 8x32-bit -> 4x64-bit
-    for (int k = 0; k < 4; k++)
-        r[k] = res[2*k] | (res[2*k+1] << 32);
+    r[0] = res0 | (res1 << 32);
+    r[1] = res2 | (res3 << 32);
+    r[2] = res4 | (res5 << 32);
+    r[3] = res6 | (res7 << 32);
 
     mod_p_reduce(r);
 }
+
 
 // -- Modular inverse (Montgomery Ladder with precomputed table) ---
 // a^(-1) mod p = a^(p-2) mod p, p = 2^255 - 19

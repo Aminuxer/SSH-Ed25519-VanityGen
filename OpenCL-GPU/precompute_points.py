@@ -1,323 +1,204 @@
 #!/usr/bin/env python3
+"""Generate ed25519_static_tables.cl -- the fixed-base table for scalar_mult
+(ed25519.cl): 4-bit signed-window ladder (donna method).
 
-"""Precompute Ed25519 scalar multiples of base point B (k=0..255).
+Self-contained: all curve data is embedded below, no external files.
+Every entry (pos, w), pos = 0..31, w = 1..8, is the point
+    w * 2^(8*pos) * B
+where B is the Ed25519 base point, computed here by double-and-add on the
+twisted Edwards curve -x^2 + y^2 = 1 + d*x^2*y^2 (a = -1).
 
-Uses the SAME projective addition formula from ed25519.cl:
-  A=Z1*Z2; B=A^2; C=X1*Y1; Dd=X2*Y2; E=C*Dd*ED_D
-  S=B+E; T=B-E
-  F=(X1*Y2+X2*Y1)*A; X3=F*T
-  F2=(Y1*Y2+X1*X2)*A; Y3=F2*S
-  Z3=S*T
-All arithmetic mod p = 2^255 - 19.
+Entry encoding (niels form, all mod p, 4 x 64-bit LE limbs):
+    ysubx = y - x
+    xaddy = y + x
+    t2d   = 2*d*x*y
+Layout in the generated file:
+    ED_NIELS_TABLE[((pos*8 + (w-1)) * 12 + 0..3]  = ysubx
+    ED_NIELS_TABLE[((pos*8 + (w-1)) * 12 + 4..7]  = xaddy
+    ED_NIELS_TABLE[((pos*8 + (w-1)) * 12 + 8..11] = t2d
+Also emitted: ED_INV_D = d^-1 mod p (the niels decode uses T = t2d * d^-1).
 
-Computation uses projective coordinates for correctness (chain addition).
-Output is converted to AFFINE coordinates (x=X/Z, y=Y/Z) to match
-the ed25519.cl table format: 8 ulong entries per point (4 x + 4 y).
-
-Outputs __constant ulong ED_TABLE[2048] formatted as hex ULL literals.
+Checks performed before writing:
+  1. embedded base point is valid (even x, on the curve)
+  2. RFC 8032 section 6.1 test vectors 1-2 reproduce exactly
+     (seed -> clamped scalar -> s*B -> 32-byte pubkey), proving the
+     embedded B is the standard Ed25519 base point
+  3. every table entry lies on the curve
+  4. entry(pos, w1) + entry(pos, w2) == entry(pos, w1+w2), all w1<w2, w1+w2<=8
+  5. entry(pos+1, w) == 256 * entry(pos, w)   (8 doublings), all w
+  6. t2d * d^-1 == 2*x*y for every entry      (decode convention)
 """
+import hashlib
+import os
 
-import sys
-import struct
+P = 2 ** 255 - 19
+D = (-121665 * pow(121666, P - 2, P)) % P
+INV2 = (P + 1) // 2
+INV_D = pow(D, P - 2, P)
 
-# ---------------------------------------------------------------------------
-# Curve constants (p = 2^255 - 19)
-# ---------------------------------------------------------------------------
-P = (1 << 255) - 19
-
-# ED_D from ed25519.cl (4 x 64-bit LE limbs)
-D = (0x75EB4DCA135978A3
-   | 0x00700A4D4141D8AB << 64
-   | 0x8CC740797779E898 << 128
-   | 0x52036CEE2B6FFE73 << 192)
-
-# Base point B from ed25519.cl
-ED_BASE_X = (0xC9562D608F25D51A
-           | 0x692CC7609525A7B2 << 64
-           | 0xC0A4E231FDD6DC5C << 128
-           | 0x216936D3CD6E53FE << 192)
-
-ED_BASE_Y = (0x6666666666666658
-           | 0x6666666666666666 << 64
-           | 0x6666666666666666 << 128
-           | 0x6666666666666666 << 192)
-
-# ---------------------------------------------------------------------------
-# Helper: limb conversion
-# ---------------------------------------------------------------------------
-
-def to_limbs(val):
-    """Python int -> 4 x 64-bit limbs (little-endian)."""
-    return [
-        val & 0xFFFFFFFFFFFFFFFF,
-        (val >> 64) & 0xFFFFFFFFFFFFFFFF,
-        (val >> 128) & 0xFFFFFFFFFFFFFFFF,
-        (val >> 192) & 0xFFFFFFFFFFFFFFFF,
-    ]
+# Ed25519 base point B, 4 x 64-bit LE limbs (identical to ED_BASE_X / ED_BASE_Y
+# in ed25519.cl). Values:
+#   x_B = 0x216936D3CD6E53FEC0A4E231FDD6DC5C692CC7609525A7B2C9562D608F25D51A
+#   y_B = 0x6666666666666666666666666666666666666666666666666666666666666658
+BX = (0xC9562D608F25D51A, 0x692CC7609525A7B2,
+      0xC0A4E231FDD6DC5C, 0x216936D3CD6E53FE)
+BY = (0x6666666666666658, 0x6666666666666666,
+      0x6666666666666666, 0x6666666666666666)
 
 
-def from_limbs(limbs):
-    """4 x 64-bit limbs (LE) -> Python int."""
-    return (limbs[0]
-          | (limbs[1] << 64)
-          | (limbs[2] << 128)
-          | (limbs[3] << 192))
+def from_limbs(l):
+    return sum(v << (64 * i) for i, v in enumerate(l))
 
 
-# ---------------------------------------------------------------------------
-# Modular arithmetic (Python bigints handle the reduction)
-# ---------------------------------------------------------------------------
-
-def mul_mod(a, b):
-    return (a * b) % P
+def to_limbs(v):
+    return [(v >> (64 * i)) & 0xFFFFFFFFFFFFFFFF for i in range(4)]
 
 
-def add_mod(a, b):
-    return (a + b) % P
+def on_curve(pt_):
+    x, y = pt_
+    # twisted edwards: -x^2 + y^2 = 1 + d*x^2*y^2
+    return (y * y - x * x - 1 - D * x * x * y * y) % P == 0
 
 
-def sub_mod(a, b):
-    return (a - b) % P
+def add_pt(A, C):
+    x1, y1 = A
+    x2, y2 = C
+    x3 = (x1 * y2 + y1 * x2) * pow(1 + D * x1 * x2 * y1 * y2, P - 2, P) % P
+    y3 = (y1 * y2 + x1 * x2) * pow(1 - D * x1 * x2 * y1 * y2, P - 2, P) % P
+    return (x3, y3)
 
 
-# ---------------------------------------------------------------------------
-# Projective addition — EXACTLY matches ed25519.cl point_add_proj
-#
-# Input/Output: (X, Y, Z) as Python ints
-# Identity: (0, 1, 1)
-# ---------------------------------------------------------------------------
-
-def point_add_proj(X1, Y1, Z1, X2, Y2, Z2):
-    """Complete projective addition for Ed25519 (a = -1)."""
-    # A = Z1 * Z2
-    A = mul_mod(Z1, Z2)
-    # B = A^2
-    B = mul_mod(A, A)
-    # C = X1 * Y1
-    C = mul_mod(X1, Y1)
-    # Dd = X2 * Y2
-    Dd = mul_mod(X2, Y2)
-    # E = C * Dd * ED_D
-    E = mul_mod(C, Dd)
-    E = mul_mod(D, E)
-
-    # S = B + E
-    S = add_mod(B, E)
-    # T = B - E
-    T = sub_mod(B, E)
-
-    # F = (X1*Y2 + X2*Y1) * A
-    F = add_mod(mul_mod(X1, Y2), mul_mod(X2, Y1))
-    F = mul_mod(F, A)
-    # X3 = F * T
-    X3 = mul_mod(F, T)
-
-    # F2 = (Y1*Y2 + X1*X2) * A  (a = -1 => y1*y2 + x1*x2)
-    F2 = add_mod(mul_mod(Y1, Y2), mul_mod(X1, X2))
-    F2 = mul_mod(F2, A)
-    # Y3 = F2 * S
-    Y3 = mul_mod(F2, S)
-
-    # Z3 = S * T
-    Z3 = mul_mod(S, T)
-
-    return X3, Y3, Z3
+def dbl_pt(A):
+    return add_pt(A, A)
 
 
-def point_add_projective(X1, Y1, Z1, X2, Y2, Z2):
-    """Wrapper with identity shortcuts (matches point_add_projective in CL)."""
-    # Identity = (0, 1, 1)
-    if X1 == 0 and Y1 == 1 and Z1 == 1:
-        return X2, Y2, Z2
-    if X2 == 0 and Y2 == 1 and Z2 == 1:
-        return X1, Y1, Z1
-    return point_add_proj(X1, Y1, Z1, X2, Y2, Z2)
+def decode_niels(ysubx, xaddy):
+    x = (xaddy - ysubx) * INV2 % P
+    y = (xaddy + ysubx) * INV2 % P
+    return (x, y)
 
 
-# ---------------------------------------------------------------------------
-# Naive double-and-add (for verification)
-# ---------------------------------------------------------------------------
-
-def scalar_mult_naive(k, BX, BY, BZ=1):
-    """Compute k*B via double-and-add MSB->LSB. For verification only."""
-    RX, RY, RZ = 0, 1, 1  # identity
-    for i in range(255, -1, -1):
-        bit = (k >> i) & 1
-        # Double
-        XD, YD, ZD = point_add_projective(RX, RY, RZ, RX, RY, RZ)
-        # Conditional add
-        XA, YA, ZA = point_add_projective(XD, YD, ZD, BX, BY, BZ)
-        if bit:
-            RX, RY, RZ = XA, YA, ZA
-        else:
-            RX, RY, RZ = XD, YD, ZD
-    return RX, RY, RZ
+def point_to_pub_bytes(pt_):
+    # RFC 8032 5.1.5: 32-byte little-endian encoding of y; the least
+    # significant bit of the first byte is set iff x is odd.
+    x, y = pt_
+    b = bytearray((y & ((1 << 256) - 1)).to_bytes(32, 'little'))
+    if x & 1:
+        b[0] |= 1
+    return bytes(b)
 
 
-# ---------------------------------------------------------------------------
-# Precomputation: 0*B .. 255*B
-# ---------------------------------------------------------------------------
-
-def precompute_table():
-    """Build table[k] = (X, Y, Z) for k*B, k=0..255."""
-    table = [(0, 1, 1)]  # k=0: identity
-    table.append((ED_BASE_X, ED_BASE_Y, 1))  # k=1: base
-    for k in range(2, 256):
-        Xp, Yp, Zp = table[k - 1]
-        Xn, Yn, Zn = point_add_projective(Xp, Yp, Zp, ED_BASE_X, ED_BASE_Y, 1)
-        table.append((Xn, Yn, Zn))
-    return table
+def clamp_seed(seed32):
+    h = hashlib.sha512(seed32).digest()[:32]
+    h = bytearray(h)
+    h[0] &= 248
+    h[31] &= 127
+    h[31] |= 64
+    return int.from_bytes(bytes(h), 'little')
 
 
-# ---------------------------------------------------------------------------
-# Verification
-# ---------------------------------------------------------------------------
-
-def to_affine(X, Y, Z):
-    """Convert projective (X,Y,Z) to affine (x,y) via modular inverse of Z."""
-    if Z == 0:
-        return None, None
-    Zi = pow(Z, P - 2, P)
-    return (X * Zi) % P, (Y * Zi) % P
-
-
-def verify(table, n=5):
-    """Compare first n entries against naive double-and-add (via affine coords).
-
-    Projective coords (X,Y,Z) are only defined up to a common scalar, so we
-    convert both to affine (x = X/Z, y = Y/Z) before comparing.
-    """
-    print("Verifying first {} points against naive double-and-add...".format(n))
-    ok = True
-    for k in range(n):
-        Xv, Yv, Zv = scalar_mult_naive(k, ED_BASE_X, ED_BASE_Y)
-        X, Y, Z = table[k]
-        xa_t, ya_t = to_affine(X, Y, Z)
-        xa_v, ya_v = to_affine(Xv, Yv, Zv)
-        if xa_t == xa_v and ya_t == ya_v:
-            print("  k={:3d}  OK  (affine x={:08x}... y={:08x}...)".format(
-                k, xa_t >> 200 if xa_t else 0, ya_t >> 200 if ya_t else 0))
-        else:
-            print("  k={:3d}  MISMATCH!".format(k))
-            print("    table affine: x={:064x} y={:064x}".format(xa_t, ya_t))
-            print("    naive affine: x={:064x} y={:064x}".format(xa_v, ya_v))
-            ok = False
-    if not ok:
-        sys.exit("Verification FAILED!")
-    print("All {} checks passed.\n".format(n))
+def scalar_mult_plain(s_int, base):
+    # MSB-first double-and-add, affine
+    IDENT = (0, 1)
+    r = IDENT
+    nbits = s_int.bit_length()
+    for i in range(nbits - 1, -1, -1):
+        r = dbl_pt(r)
+        if (s_int >> i) & 1:
+            r = add_pt(r, base)
+    return r
 
 
-# ---------------------------------------------------------------------------
-# Additional cross-checks
-# ---------------------------------------------------------------------------
+B = (from_limbs(BX), from_limbs(BY))
 
-def check_curve_equation(X, Y, Z, label=""):
-    """Verify -x^2 + y^2 = 1 + d*x^2*y^2 in affine coords."""
-    Zi = pow(Z, P - 2, P)
-    xa = (X * Zi) % P
-    ya = (Y * Zi) % P
-    lhs = (P - xa * xa % P + ya * ya % P) % P
-    rhs = (1 + D * xa % P * xa % P * ya % P * ya % P) % P
-    status = "OK" if lhs == rhs else "FAIL"
-    if label:
-        print("  {} curve check: {}".format(label, status))
-    return status == "OK"
+# ---------------- self-check of the embedded base point ---------------------
+assert B[0] % 2 == 0, "BX must be even"
+assert on_curve(B), "base point B not on curve"
 
+# RFC 8032 section 6.1 test vectors (golden check: proves B is the standard
+# Ed25519 base point, independently of any external table).
+RFC_VECTORS = [
+    (bytes.fromhex('9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60'),
+     'd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a'),
+    (bytes.fromhex('4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb'),
+     '3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c'),
+]
+for idx, (seed, expected_pub) in enumerate(RFC_VECTORS, 1):
+    got = point_to_pub_bytes(scalar_mult_plain(clamp_seed(seed), B)).hex()
+    assert got == expected_pub, \
+        f"RFC 8032 vec{idx} FAIL: got {got}, want {expected_pub}"
+print("RFC 8032 6.1 test vectors 1-2: OK")
 
-def cross_check(table):
-    """Additional sanity checks on the table."""
-    print("Additional cross-checks:")
-    # Verify each point satisfies the curve equation
-    for k in [0, 1, 10, 255]:
-        check_curve_equation(*table[k], "k={}".format(k))
+# ---------------- generate all 256 entries ----------------------------------
+IDENT = (0, 1)
+table = []          # index (pos*8 + (w-1)) -> (ysubx, xaddy, t2d)
+P_base = B          # 2^(8*pos) * B
+for pos in range(32):
+    acc = IDENT
+    for w in range(1, 9):
+        acc = add_pt(acc, P_base)
+        x, y = acc
+        assert on_curve(acc), f"entry ({pos},{w}) off curve"
+        table.append(((y - x) % P, (y + x) % P, (2 * D * x * y) % P))
+    for _ in range(8):
+        P_base = dbl_pt(P_base)
 
-    # Verify additive chain: table[k] + B == table[k+1]
-    print("  Chain check (table[k]+B==table[k+1] for k=0..10):")
-    for k in range(11):
-        Xa, Ya, Za = point_add_projective(*table[k], ED_BASE_X, ED_BASE_Y, 1)
-        Xb, Yb, Zb = table[k + 1]
-        if Xa == Xb and Ya == Yb and Za == Zb:
-            print("    k={}: OK".format(k))
-        else:
-            print("    k={}: FAIL (coords differ)".format(k))
-            sys.exit("Cross-check failed!")
+# ---------------- check 4: closure under addition (w1+w2 <= 8) --------------
+for pos in range(32):
+    for w1 in range(1, 8):
+        for w2 in range(w1 + 1, 9 - w1):
+            s = add_pt(decode_niels(*table[pos * 8 + w1 - 1][:2]),
+                       decode_niels(*table[pos * 8 + w2 - 1][:2]))
+            assert s == decode_niels(*table[pos * 8 + w1 + w2 - 1][:2]), \
+                f"add-check FAIL pos={pos} w1={w1} w2={w2}"
+print("CHECK (entry(w1)+entry(w2)==entry(w1+w2)): OK")
 
+# ---------------- check 5: entry(pos+1, w) == 256 * entry(pos, w) -----------
+for pos in range(31):
+    for w in range(1, 9):
+        pt_ = decode_niels(*table[pos * 8 + w - 1][:2])
+        for _ in range(8):
+            pt_ = dbl_pt(pt_)
+        assert pt_ == decode_niels(*table[(pos + 1) * 8 + w - 1][:2]), \
+            f"scale-check FAIL pos={pos} w={w}"
+print("CHECK (row pos+1 == 256 * row pos): OK")
 
-# ---------------------------------------------------------------------------
-# Output generation
-# ---------------------------------------------------------------------------
+# ---------------- check 6: t2d * d^-1 == 2*x*y (decode convention) ---------
+for e, (ys, xa, t2d) in enumerate(table):
+    x, y = decode_niels(ys, xa)
+    assert t2d * INV_D % P == 2 * x * y % P, f"t2d convention FAIL entry {e}"
+print("CHECK (t2d * INV_D == 2*x*y): OK")
 
-def hex_limbs(val):
-    """Format a 64-bit limb as 0x...ULL."""
-    return "0x{:016X}ULL".format(val & 0xFFFFFFFFFFFFFFFF)
+# ---------------- emit the table file ---------------------------------------
+out = []
+out.append("// Auto-generated by precompute_points.py -- do not edit by hand.")
+out.append("// 4-bit window fixed-base niels table for scalar_mult (donna method).")
+out.append("// Entry (pos, w), pos = 0..31, w = 1..8: point w*2^(8*pos)*B in niels form:")
+out.append("//   ysubx = y - x, xaddy = y + x, t2d = 2*d*x*y   (all mod p, 4x ulong LE)")
+out.append("// Layout: ED_NIELS_TABLE[((pos*8 + (w-1)) * 12 + 0..3]  = ysubx")
+out.append("//         ED_NIELS_TABLE[((pos*8 + (w-1)) * 12 + 4..7]  = xaddy")
+out.append("//         ED_NIELS_TABLE[((pos*8 + (w-1)) * 12 + 8..11] = t2d")
+out.append("// Size: 256 entries * 96 bytes = 24576 bytes = 24 KB")
+out.append("")
+out.append("// Curve constant d: d = -121665/121666 mod p")
+out.append("// d^-1 (used by the niels decode: T = t2d * d^-1):")
+inv_d_l = to_limbs(INV_D)
+out.append("__constant ulong ED_INV_D[4] = {")
+out.append("    0x%016XULL, 0x%016XULL," % (inv_d_l[0], inv_d_l[1]))
+out.append("    0x%016XULL, 0x%016XULL};\n" % (inv_d_l[2], inv_d_l[3]))
+out.append("__constant ulong ED_NIELS_TABLE[3072] = {")
+first = True
+for ys, xa, t2d in table:
+    line = []
+    for v in (ys, xa, t2d):
+        line += ["0x%016XULL" % vv for vv in to_limbs(v)]
+    prefix = "" if first else ",\n"
+    first = False
+    out.append(prefix + "    " + ", ".join(line))
+out.append("};")
 
-
-def output_constant(table):
-    """Print the __constant ulong ED_TABLE[2048] declaration (affine coords).
-
-    Converts each projective point (X, Y, Z) to affine (x, y) and outputs
-    8 ulong entries per point: 4 x limbs + 4 y limbs.
-    This matches the format expected by ed25519.cl scalar_mult().
-    """
-    print("// Ed25519 precomputed scalar multiples of base point B")
-    print("//  k*B stored as (x, y) in AFFINE coords, mod p = 2^255 - 19")
-    print("//  Each point: 4 x limbs + 4 y limbs = 8 ulong entries")
-    print("//  ED_TABLE[k*8 + 0..3] = x(k*B)")
-    print("//  ED_TABLE[k*8 + 4..7] = y(k*B)")
-    print("//  256 points x 8 limbs = 2048 total entries")
-    print("//  Table size: 2048 x 8 = 16384 bytes = 16 KB")
-    print("// Curve constants (for reference):")
-    print("//  P = 2^255 - 19")
-    print("//  D = {}".format(hex_limbs(D) + " | " + hex_limbs(D >> 64) + " | " + hex_limbs(D >> 128) + " | " + hex_limbs(D >> 192)))
-    print("//  Bx= {}".format(hex_limbs(ED_BASE_X) + " | " + hex_limbs(ED_BASE_X >> 64) + " | " + hex_limbs(ED_BASE_X >> 128) + " | " + hex_limbs(ED_BASE_X >> 192)))
-    print("//  By= {}".format(hex_limbs(ED_BASE_Y) + " | " + hex_limbs(ED_BASE_Y >> 64) + " | " + hex_limbs(ED_BASE_Y >> 128) + " | " + hex_limbs(ED_BASE_Y >> 192)))
-    print()
-    print("__constant ulong ED_TABLE[2048] = {")
-
-    total = 0
-    for k in range(256):
-        X, Y, Z = table[k]
-        # Convert projective -> affine
-        xa, ya = to_affine(X, Y, Z)
-        limbs = to_limbs(xa) + to_limbs(ya)
-        line = "    " + ", ".join(hex_limbs(l) for l in limbs)
-        if k < 255:
-            print(line + ",")
-        else:
-            print(line)
-        total += 8
-
-    print("};")
-    print("// Total entries: {}".format(total))
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main():
-    print("=" * 60)
-    print("Ed25519 Precomputation: 0*B .. 255*B")
-    print("=" * 60)
-    print()
-    print("Curve parameters:")
-    print("  p  = {}".format(P))
-    print("  p  = 0x{:x}".format(P))
-    print("  D  = 0x{:x}".format(D))
-    print("  Bx = 0x{:x}".format(ED_BASE_X))
-    print("  By = 0x{:x}".format(ED_BASE_Y))
-    print()
-
-    # Precompute
-    table = precompute_table()
-
-    # Verify
-    verify(table, 5)
-    cross_check(table)
-
-    # Output
-    output_constant(table)
-
-
-if __name__ == "__main__":
-    main()
+text = "\n".join(out) + "\n"
+dest = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                    'ed25519_static_tables.cl')
+open(dest, 'w').write(text)
+print(f"wrote {dest} ({len(text)} bytes, 256 entries)")

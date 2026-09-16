@@ -231,11 +231,12 @@ python3 ssh_ed25519_vanity_multicpu.py --patterns-file patterns-list.txt -o KEYS
 
 | Hardware | CU * WG | Cores ALL | ~ keys per second |
 ---|---|---|---|
-| GTX 1070 | 15 * 1024 | 15360 | 320 000 |
-| GTX 1080 Ti | 28 * 1024 | 28672 | 590 000 |
-| GTX 3060 | 28 * 1024 | 28672 | 800 000 |
-| RTX 5070 | 48 * 1024 | 49152 | 2 730 000 |
-| H100 NVL | 132 * 1024 | 135168 | 5 170 000 |
+| GTX 1070 | 15 * 1024 | 15360 | 2 300 000 |
+| GTX 1080 Ti | 28 * 1024 | 28672 | 3 200 000 |
+| GTX 3060 | 28 * 1024 | 28672 | ??? |
+| RTX 5070 | 48 * 1024 | 49152 | ??? |
+| H100 NVL | 132 * 1024 | 135168 | 27 800 000 |
+| H100 PCIe | 114 * 1024 | 116736 | 24 200 000 |
 
 * How many keys need brute until found key ?
   - You can calucate math-estimate by formula :
